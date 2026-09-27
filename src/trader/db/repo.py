@@ -15,11 +15,11 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import Connection, text, update
+from sqlalchemy import Connection, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
 from trader.db.tables import (
@@ -42,6 +42,7 @@ from trader.models import (
     Order,
     OrderStatus,
     Proposal,
+    RiskContext,
     RunMode,
     RunStatus,
     Side,
@@ -355,6 +356,50 @@ def record_cancelled_order(
     )
 
 
+# ---- Risk context ----------------------------------------------------------------------------------------
+
+
+def risk_context(conn: Connection, *, run_date: date, paper: bool, peak_since: date | None) -> RiskContext:
+    """What the risk engine needs from earlier runs, as of `run_date` (HANDOFF §9).
+
+    Reads every dry_run and submit run with this `paper` flag, whatever its status: a run that failed or was
+    abandoned can still have sent real orders, and its snapshot is a real account read. Offline runs are
+    left out, and so are runs dated after `run_date`.
+
+    - equity_peak: the highest snapshot equity from runs dated on or after `peak_since` (all history when
+      it's None), or None when there's none. Unknown (NULL) equities are skipped. The engine compares the
+      peak with current equity itself.
+    - new_positions_this_week: submitted orders that open a position, from runs dated from this week's
+      Monday through `run_date`. Entries that never filled still count.
+    """
+    day = _day(run_date)
+    counted = (
+        runs.c.mode.in_([RunMode.DRY_RUN.value, RunMode.SUBMIT.value]),
+        runs.c.paper == paper,
+        runs.c.run_date <= day,
+    )
+    peak = (
+        select(func.max(account_snapshots.c.equity)).select_from(account_snapshots.join(runs)).where(*counted)
+    )
+    if peak_since is not None:
+        peak = peak.where(runs.c.run_date >= _day(peak_since))
+    monday = day - timedelta(days=day.weekday())
+    new_positions = (
+        select(func.count())
+        .select_from(orders.join(runs))
+        .where(
+            *counted,
+            runs.c.run_date >= monday,
+            orders.c.status == OrderStatus.SUBMITTED.value,
+            orders.c.opens_new_position.is_(True),
+        )
+    )
+    return RiskContext(
+        new_positions_this_week=_int(conn.execute(new_positions).scalar_one()),
+        equity_peak=_optional_float(conn.execute(peak).scalar_one()),
+    )
+
+
 # ---- Conversions at the database boundary ----------------------------------------------------------------
 
 
@@ -421,3 +466,12 @@ def _int(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"expected an integer from the database, got {value!r}")
     return value
+
+
+def _optional_float(value: object) -> float | None:
+    """A NUMERIC value, read back as the float the domain uses."""
+    if value is None:
+        return None
+    if not isinstance(value, Decimal):
+        raise TypeError(f"expected a NUMERIC value from the database, got {value!r}")
+    return float(value)
