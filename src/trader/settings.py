@@ -1,23 +1,76 @@
-"""Configuration loading (HANDOFF §12). Config is read once at startup and passed down, never read globally.
+"""Configuration loading (HANDOFF §4 and §12). Config is read once at startup and passed down, never read
+globally.
 
-M1 loads `config/policy.yaml`. M3 adds `strategy.yaml`, prompt assembly and secrets.
+`load_config()` reads `config/policy.yaml`, `config/strategy.yaml` and the two prompt files, and assembles the
+system prompt and its version. The paths are relative to the working directory (HANDOFF §13): /app in the dev
+container, /var/task in the Lambda image.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from trader.models import Policy, StopPolicy, finite_float, normalize_symbol
+from trader.models import Policy, Prices, StopPolicy, Strategy, finite_float, normalize_symbol
+
+POLICY_FILE = Path("config/policy.yaml")
+STRATEGY_FILE = Path("config/strategy.yaml")
+
+# HANDOFF §4: the system prompt is system_frame.md, this separator, then strategy.md.
+PROMPT_SEPARATOR = "\n\n---\n\n"
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+_BLANK_LINES = re.compile(r"\n(?:[ \t]*\n){2,}")  # two or more blank lines in a row
 
 
 class ConfigError(ValueError):
     """A config file is missing, malformed, or holds a value the app can't use."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Config:
+    """Everything a run reads from `config/`, loaded once at startup."""
+
+    policy: Policy
+    strategy: Strategy
+    system_prompt: str
+    prompt_version: str  # the first 10 hex characters of the system prompt's SHA-256
+
+
+def load_config(root: Path) -> Config:
+    """Read the config files under `root`, the directory their paths are relative to."""
+    strategy = load_strategy(root / STRATEGY_FILE)
+    system_prompt = assemble_system_prompt(
+        _read_text(root / strategy.system_frame), _read_text(root / strategy.strategy_prompt)
+    )
+    return Config(
+        policy=load_policy(root / POLICY_FILE),
+        strategy=strategy,
+        system_prompt=system_prompt,
+        prompt_version=prompt_version(system_prompt),
+    )
+
+
+def assemble_system_prompt(system_frame: str, strategy: str) -> str:
+    """HANDOFF §4: the frame, a separator, then the strategy without its HTML comments.
+
+    In each part, runs of blank lines collapse to one, and leading and trailing whitespace is trimmed. The
+    files are read with universal newlines, so a CRLF checkout gives the same prompt.
+    """
+    parts = (system_frame, _HTML_COMMENT.sub("", strategy))
+    return PROMPT_SEPARATOR.join(_BLANK_LINES.sub("\n\n", part).strip() for part in parts)
+
+
+def prompt_version(system_prompt: str) -> str:
+    """The first 10 hex characters of the prompt's SHA-256 (HANDOFF §4)."""
+    return hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:10]
 
 
 # A number's allowed range: the check, and how an error message describes it.
@@ -65,11 +118,46 @@ def load_policy(path: Path) -> Policy:
     )
 
 
-def _read_yaml(path: Path) -> object:
+def load_strategy(path: Path) -> Strategy:
+    """Read `strategy.yaml` into a Strategy, raising ConfigError naming the key when one is unusable."""
+    top = _Section(_read_yaml(path), path, "", _field_names(Strategy))
+    price = top.section("price", _field_names(Prices))
+    sector_etfs = top.tickers("sector_etfs")
+    industry_etfs = top.tickers("industry_etfs")
+    if both := [symbol for symbol in industry_etfs if symbol in sector_etfs]:
+        # The briefing's ETF table gives each ETF one type.
+        raise top.error("industry_etfs", f"{', '.join(both)} also listed in sector_etfs")
+    return Strategy(
+        model=top.text("model"),
+        max_tokens=top.count("max_tokens", minimum=1),
+        max_turns=top.count("max_turns", minimum=1),
+        max_tool_calls=top.count("max_tool_calls"),
+        benchmark=top.ticker("benchmark"),
+        sector_etfs=sector_etfs,
+        industry_etfs=industry_etfs,
+        baseline_basket=top.tickers("baseline_basket"),
+        news_lookback_hours=top.number("news_lookback_hours", _ABOVE_0),
+        max_news_items=top.count("max_news_items"),
+        price=Prices(
+            input=price.number("input", _AT_LEAST_0),
+            output=price.number("output", _AT_LEAST_0),
+            cache_write=price.number("cache_write", _AT_LEAST_0),
+            cache_read=price.number("cache_read", _AT_LEAST_0),
+        ),
+        system_frame=top.text("system_frame"),
+        strategy_prompt=top.text("strategy_prompt"),
+    )
+
+
+def _read_text(path: Path) -> str:
     try:
-        text = path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")  # universal newlines: CRLF reads as LF
     except OSError as exc:
         raise ConfigError(f"{path}: can't read the file: {exc.strerror or exc}") from exc
+
+
+def _read_yaml(path: Path) -> object:
+    text = _read_text(path)
     try:
         return yaml.safe_load(text)
     # PyYAML raises a plain ValueError for an impossible date such as 2026-13-01.
@@ -113,10 +201,10 @@ class _Section:
             raise self.error(key, f"must be true or false, got {value!r}")
         return value
 
-    def count(self, key: str) -> int:
+    def count(self, key: str, *, minimum: int = 0) -> int:
         value = self._data[key]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise self.error(key, f"must be a whole number >= 0, got {value!r}")
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise self.error(key, f"must be a whole number >= {minimum}, got {value!r}")
         return value
 
     def number(self, key: str, allowed: _Range) -> float:
@@ -126,6 +214,12 @@ class _Section:
         if number is None or not check(number):
             raise self.error(key, f"must be a number {description}, got {value!r}")
         return number
+
+    def text(self, key: str) -> str:
+        value = self._data[key]
+        if not isinstance(value, str) or not value.strip():
+            raise self.error(key, f"must be a non-empty string, got {value!r}")
+        return value
 
     def optional_date(self, key: str) -> date | None:
         value = self._data[key]
@@ -140,20 +234,36 @@ class _Section:
                 pass
         raise self.error(key, f"must be null or a date such as 2026-10-01, got {value!r}")
 
+    def ticker(self, key: str) -> str:
+        return self._ticker(key, self._data[key])
+
+    def tickers(self, key: str) -> tuple[str, ...]:
+        """An ordered list of tickers, each listed once."""
+        symbols: list[str] = []
+        for item in self._list(key):
+            symbol = self._ticker(key, item)
+            if symbol in symbols:
+                raise self.error(key, f"{symbol} is listed twice")
+            symbols.append(symbol)
+        return tuple(symbols)
+
     def symbols(self, key: str) -> frozenset[str]:
+        return frozenset(self._ticker(key, item) for item in self._list(key))
+
+    def _list(self, key: str) -> list[object]:
         value = self._data[key]
         if not isinstance(value, list):
             raise self.error(key, f"must be a list of tickers, got {value!r}")
-        symbols: set[str] = set()
-        for item in value:
-            symbol = normalize_symbol(item)
-            if symbol is None:
-                hint = ""
-                if item is None or isinstance(item, bool):
-                    hint = (
-                        "; YAML reads unquoted words such as ON, YES, NO and NULL as true, false or null, "
-                        "so quote them"
-                    )
-                raise self.error(key, f"{item!r} is not a ticker{hint}")
-            symbols.add(symbol)
-        return frozenset(symbols)
+        return value
+
+    def _ticker(self, key: str, item: object) -> str:
+        symbol = normalize_symbol(item)
+        if symbol is None:
+            hint = ""
+            if item is None or isinstance(item, bool):
+                hint = (
+                    "; YAML reads unquoted words such as ON, YES, NO and NULL as true, false or null, "
+                    "so quote them"
+                )
+            raise self.error(key, f"{item!r} is not a ticker{hint}")
+        return symbol
