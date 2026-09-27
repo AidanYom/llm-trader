@@ -103,7 +103,7 @@ Before asking for review, `make lint && make test` must pass locally, and CI mus
 - **mypy** checks the type hints in strict mode: every function fully annotated, no implicit `Any`. Don't add `# type: ignore` without a comment explaining why.
 - **Domain types** are dataclasses in `models.py`. Sizing math uses floats; prices on orders are rounded to cents when the risk engine creates the `Order`. Convert to and from `Decimal` only at the `repo.py` boundary (the database uses NUMERIC).
 - **Keep I/O at the edges.** Only `brokers/`, `db/`, the SDK call in `agent.py`, and `run.py` touch the outside world. Keep `risk.py` and `briefing.py` pure so they stay trivially testable.
-- **Time must be timezone-aware.** `run_date` is the America/New_York date; stored timestamps are UTC `TIMESTAMPTZ`. Never call naive `datetime.now()`. Inject `now` into `run_daily` so tests can pin it.
+- **Time must be timezone-aware.** `run_date` is the America/New_York date; stored timestamps are UTC `TIMESTAMPTZ`. Never call naive `datetime.now()`. Inject a clock into `run_daily` so tests can pin the time.
 - **Errors:** raise specific exceptions. `run_daily` catches at the top only to mark the run `failed` with the error text, then re-raises. Tool errors inside the Claude loop go back to the model as text, never as a crash.
 - **Logging** uses stdlib `logging` with the JSON formatter. The CLI prints the run summary; library code never calls `print`.
 - **Config:** a new setting goes in the YAML with a comment, and is loaded in `settings.py` and documented in the README. Don't hard-code values that belong in config.
