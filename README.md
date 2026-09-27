@@ -15,8 +15,9 @@ Nothing else goes on the host. Python, uv (the package manager), Ruff (the linte
 ## Setup
 
 ```bash
-make build   # build the dev image
-make test    # start Postgres and run the tests
+make build     # build the dev image
+make test      # start Postgres and run the tests
+make migrate   # create the tables in the dev database
 ```
 
 API keys are only needed for `make smoke`, `make dry-run` and `make submit`. For those, copy `.env.example` to `.env` (gitignored) and fill in the keys. Keep `ALPACA_PAPER=true`.
@@ -73,14 +74,33 @@ The values are Aidan's; the file holds the current ones, and its comments explai
 | `stop.required` | Must be `true`: every buy carries a protective stop. | settings |
 | `stop.min_pct`, `stop.max_pct` | The allowed stop distance below the last close, in %. | risk engine |
 | `drawdown_freeze_pct` | When equity is this far below its peak, buys are rejected. Sells still go through. | risk engine |
-| `drawdown_peak_since` | A date: only equity from then on counts toward the peak. `null` uses all history. Set it at go-live or after a paper reset. | database (M2) |
+| `drawdown_peak_since` | A date: only equity from then on counts toward the peak. `null` uses all history. Set it at go-live or after a paper reset. | risk-context query |
 | `blocked_symbols` | Tickers that can never be bought. Quote any that YAML would read as true, false or null, such as `'ON'`. | risk engine |
+
+## Database
+
+Postgres 16 records every run: its briefing, tool calls, proposals, verdicts, orders and cost (HANDOFF §10).
+
+- `src/trader/db/tables.py` defines the schema with SQLAlchemy Core: table definitions plus a query builder, with no ORM.
+- `src/trader/db/repo.py` holds every query, as explicit functions.
+- Alembic manages the migrations in `migrations/versions/`, the way Flyway would. `make migrate` brings the dev database up to date.
+- The app refuses to run against a database at any revision other than `SCHEMA_HEAD` in `tables.py`.
+
+To change the schema:
+
+1. Edit `src/trader/db/tables.py`.
+2. Run `make migrate`, so the dev database is at head, then `make revision m="describe the change"`. Alembic drafts a migration by comparing `tables.py` with the dev database, and Ruff formats it.
+3. Read the draft and fix it by hand. Autogenerate doesn't compare check constraints or partial-index conditions, so it misses changes to them. Write a working `downgrade`.
+4. Set `SCHEMA_HEAD` in `tables.py` to the new revision. A unit test fails until it matches.
+5. Run `make migrate && make test`.
+
+`make test` wipes the `trader_test` database and migrates it once per run, and empties its tables before each integration test. The tests refuse any database whose name doesn't end in `_test`. One test checks that the migrations build exactly what `tables.py` describes, including the parts Alembic can't compare.
 
 ## CI
 
 GitHub Actions runs two jobs on every push and on pull requests to `main`. Both must pass before a merge.
 
-- `test` installs from the lock, runs Ruff's lint and format checks and mypy, then runs pytest against a Postgres 16 service.
+- `test` installs from the lock and runs Ruff's lint and format checks and mypy. Then, against a Postgres 16 service, it applies the migrations, runs `alembic check` (which fails if `tables.py` and the migrations disagree), and runs pytest.
 - `image` builds the Lambda image without pushing it.
 
 ## Windows notes

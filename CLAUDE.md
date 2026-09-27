@@ -19,7 +19,7 @@ Keep this section current: update it in the pull request that completes each mil
 
 - [x] M0 Skeleton (Docker, Compose, Makefile, uv, ruff, pytest, CI)
 - [x] M1 Domain models and risk engine
-- [ ] M2 Database: tables, Alembic, repository, integration tests
+- [x] M2 Database: tables, Alembic, repository, integration tests
 - [ ] M3 Offline end to end: fake broker, briefing, agent loop, run, report, CLI
 - [ ] M4 Real Alpaca and Anthropic locally (`make smoke`, `make dry-run`)
 - [ ] M5 Production: Lambda image, Terraform, Neon, deploy, alarm
@@ -124,10 +124,11 @@ Before asking for review, `make lint && make test` must pass locally, and CI mus
 - The schema lives in `db/tables.py` (SQLAlchemy Core `MetaData` with a naming convention). HANDOFF §10 is the reference schema.
 - For every schema change:
   1. Edit `tables.py`.
-  2. Run `make revision m="…"`.
-  3. **Read and fix the generated file by hand.** Autogenerate misses partial indexes, check constraints and server defaults.
+  2. Run `make migrate` (the dev database must be at head), then `make revision m="…"`.
+  3. **Read and fix the generated file by hand.** Autogenerate doesn't compare check constraints or partial-index conditions, so it misses changes to them.
   4. Implement a working `downgrade`.
-  5. Run `make migrate && make test`.
+  5. Set `SCHEMA_HEAD` in `tables.py` to the new revision.
+  6. Run `make migrate && make test`. `test_migrated_schema_matches_tables_py` fails if the migrations and `tables.py` disagree anywhere.
 - Never edit a migration that has been merged; write a new one.
 - CI runs `alembic upgrade head`, `alembic check` (no drift allowed) and a round-trip test (upgrade → downgrade to base → upgrade).
 - Production migrations run by hand with `make migrate-prod` before deploying code that needs them. The Lambda refuses to run if the database isn't at head.
