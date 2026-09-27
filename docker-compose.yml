@@ -1,0 +1,42 @@
+# Local development: Postgres 16 plus the dev tooling image (HANDOFF §13).
+name: llm-trader
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trader
+      POSTGRES_DB: trader
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Check over TCP: during first-time setup Postgres listens only on its socket,
+      # so a socket check would pass before the init script has created trader_test.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U trader -d trader"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  app:
+    build:
+      context: .
+      target: dev
+    env_file:
+      - path: .env
+        required: false # keys are only needed for smoke, dry-run and submit
+    environment:
+      DATABASE_URL: postgresql+psycopg://trader:trader@db:5432/trader
+      TEST_DATABASE_URL: postgresql+psycopg://trader:trader@db:5432/trader_test
+    volumes:
+      - .:/app
+      - /app/.venv # keeps the image's venv visible under the bind mount
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
