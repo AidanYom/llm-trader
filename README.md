@@ -52,7 +52,29 @@ Dependencies are declared in `pyproject.toml` and pinned in `uv.lock`. To add on
 
 ## Configuration
 
-`config/` arrives in M1. Each setting is documented here when it's added.
+Settings live in `config/`. `src/trader/settings.py` reads them once at startup, and the app refuses to start if a file has an unknown, missing or unusable key. Each setting is documented here when it's added.
+
+### `config/policy.yaml`: risk limits and switches
+
+The values are Aidan's; the file holds the current ones, and its comments explain them. Percentages are of account equity unless the table says otherwise.
+
+| Setting | What it does | Read by |
+|---|---|---|
+| `trading_enabled` | Kill switch. When `false`, runs still research, evaluate and record, but send no orders. | run (M3) |
+| `allow_live_money` | Must be `true` before the app will run against a non-paper Alpaca account. | run (M3) |
+| `max_position_pct` | The most one symbol may hold, existing holding included. Larger buys are trimmed to fit. | risk engine |
+| `max_open_positions` | The most positions open at once. Exits approved in the same run free their slots. | risk engine |
+| `max_new_positions_per_week` | New symbols opened per week, Monday to Sunday. Adding to a holding doesn't count. | risk engine |
+| `min_cash_buffer_pct` | Cash that buys never spend. Proceeds from sales in the same run never fund buys. | risk engine |
+| `min_price` | The lowest last close, in dollars, a buy may have. | risk engine |
+| `min_avg_dollar_volume` | The lowest 20-session average of close × volume, in dollars, a buy may have. | risk engine |
+| `max_pct_of_adv` | The largest buy, as a % of that average. Larger buys are trimmed. | risk engine |
+| `entry_limit_buffer_pct` | Buys are limit orders at the last close plus this %. | risk engine |
+| `stop.required` | Must be `true`: every buy carries a protective stop. | settings |
+| `stop.min_pct`, `stop.max_pct` | The allowed stop distance below the last close, in %. | risk engine |
+| `drawdown_freeze_pct` | When equity is this far below its peak, buys are rejected. Sells still go through. | risk engine |
+| `drawdown_peak_since` | A date: only equity from then on counts toward the peak. `null` uses all history. Set it at go-live or after a paper reset. | database (M2) |
+| `blocked_symbols` | Tickers that can never be bought. Quote any that YAML would read as true, false or null, such as `'ON'`. | risk engine |
 
 ## CI
 
