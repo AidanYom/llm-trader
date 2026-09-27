@@ -82,6 +82,7 @@ The initial contents of both files are in Appendix A. In short:
 - **Proposal parsing:**
   - Required fields: `symbol`, `action` ∈ {buy, sell}, and a non-empty `thesis` and `invalidation`.
   - Numeric fields are coerced to float. `stop_pct` and `take_profit_pct` are optional, with 0 or empty treated as absent. `confidence` defaults to 0.5.
+  - A number is malformed if it isn't finite, if a percentage (`target_pct`, `stop_pct`, `take_profit_pct`) is 1,000 or more, or −1,000 or less, or if `confidence` is outside 0–1, Appendix B's range. These bounds keep every value inside its column (section 10). They also cap take-profit prices, so verdict and order prices can't overflow either.
   - Anything failing these checks is stored in `malformed_proposals` with the error, and never reaches the risk engine.
 - **Cost:**
   - `cost_usd = (input·p_in + output·p_out + cache_write·p_cw + cache_read·p_cr) / 1e6`, using prices from `strategy.yaml` (Sonnet 5: $2 input, $10 output, $2.50 5-minute cache write, $0.20 cache read, per million tokens).
@@ -211,16 +212,20 @@ Offline runs are excluded from risk-context queries and from reports.
 
 **Guards:**
 - **Schema version:** at startup, the database's Alembic revision must equal the code's head. Otherwise fail with a clear message.
+  - The code's head is `SCHEMA_HEAD` in `db/tables.py`, and a unit test keeps it equal to the newest migration. So the Lambda image doesn't need the migration files.
 - **Live money:** if `broker.is_paper` is false and `policy.allow_live_money` isn't true, raise before any account call.
 - **Market closed:** if today isn't a trading day, record the run as `skipped` ("market closed today") and stop.
 - **One submit run per day:** starting a submit run inserts a `runs` row with status `running`. A partial unique index (section 10) blocks a second `running` or `completed` submit run for the same `(run_date, paper)`. On conflict, record a `skipped` run with the reason "already ran in submit mode today".
   - `--force` only marks a stale `running` row for today as `abandoned` (for example after a Lambda timeout). It never allows a second completed submit run.
+  - Only a `running` row can be marked `completed` or `failed`. So if an abandoned run was in fact still going, it can't complete behind the run that replaced it.
 - **Kill switch:** `policy.trading_enabled: false` means runs still research, evaluate and persist, but every order is recorded as `not_submitted` with the reason "trading_enabled is false".
 - **Failure:** any exception marks the run `failed`, stores the error text, and re-raises (the Lambda error alarm fires).
 
-**Risk context** comes from Postgres, using only completed `dry_run` and `submit` runs with the same `paper` flag:
-- `equity_peak` is the maximum snapshot equity since `policy.drawdown_peak_since` (or all history if that's null), compared against current equity.
+**Risk context** comes from Postgres, using every `dry_run` and `submit` run with the same `paper` flag, whatever its status. Offline runs are excluded.
+- Failed and abandoned runs count because their rows hold real data. A run can send real orders and then fail, or time out and be abandoned. A snapshot exists only if the account read succeeded, and an order is `submitted` only if the broker accepted it.
+- `equity_peak` is the maximum snapshot equity from runs dated on or after `policy.drawdown_peak_since` (or all history if that's null), compared against current equity. A snapshot whose equity is unknown (NULL, see section 10) is skipped.
 - `new_positions_this_week` counts submitted orders with `opens_new_position` whose run date falls on or after this week's Monday. Unfilled entries still count; this is deliberately conservative.
+- Both are as of the run date: runs dated later are ignored. This week's Monday comes from the America/New_York `run_date`.
 
 **Persistence order:**
 1. The `runs` row is committed immediately.
@@ -239,6 +244,12 @@ Offline runs are excluded from risk-context queries and from reports.
   - Merged migrations are never edited.
   - The `MetaData` uses a constraint naming convention so autogenerate stays stable.
 - **Types:** NUMERIC for money, prices and percentages. TIMESTAMPTZ for times. `run_date` is the America/New_York date.
+- **IDs and defaults:** `runs.id` defaults to `gen_random_uuid()`, and the other tables use bigint identity columns. `created_at` columns default to `now()`. The times of runs and snapshots are passed in, so tests can pin them, and `repo.py` refuses a datetime without a time zone.
+- **Nullability:** where the tables below don't say, a column is NOT NULL when every writer always has its value. `db/tables.py` is exact.
+- **Values Postgres refuses** are made storable in `repo.py`:
+  - A NaN or infinity bound for a NUMERIC column is written as NULL, meaning unknown. That's why numbers that come from the broker or the model are nullable. Postgres sorts NaN above every number, so a stored NaN equity would become the peak and block every buy.
+  - NUL characters in text are replaced with U+FFFD: Postgres refuses them in TEXT and JSONB, and news text is untrusted.
+  - NaN and infinities inside JSONB are written as the strings `"NaN"`, `"Infinity"` and `"-Infinity"`.
 
 **Tables:**
 
@@ -291,7 +302,7 @@ Offline runs are excluded from risk-context queries and from reports.
 - `seq` INT
 - `name` TEXT
 - `input` JSONB
-- `result_excerpt` TEXT (first 1,500 characters)
+- `result_excerpt` TEXT (first 1,500 characters; null when no result was sent back, as for `submit_proposals`)
 - unique `(run_id, seq)`
 
 `proposals`
@@ -327,7 +338,7 @@ Offline runs are excluded from risk-context queries and from reports.
 - `proposal_id` foreign key
 - `client_order_id` TEXT
 - `symbol` TEXT
-- `side` TEXT
+- `side` TEXT, check ∈ {buy, sell}
 - `qty` INT
 - `limit_price`, `stop_price`, `take_profit_price` NUMERIC(14,2)
 - `opens_new_position` BOOLEAN
@@ -336,14 +347,14 @@ Offline runs are excluded from risk-context queries and from reports.
 - `broker_order_id` TEXT
 - `broker_status` TEXT
 - `error` TEXT
-- `created_at` TIMESTAMPTZ
-- Partial unique index on `client_order_id` WHERE `status = 'submitted'`
+- `created_at` TIMESTAMPTZ default now()
+- No unique index on `client_order_id`. The row is written after the broker call, so such an index could only fire after an order was really placed, and would lose that order's record. The broker's duplicate check and the one-submit-per-day index already make reruns safe.
 
 `cancelled_orders`
 - `id` identity primary key
 - `run_id` foreign key
 - `broker_order_id` TEXT
-- `symbol` TEXT
+- `symbol` TEXT, nullable: `cancel_open_buy_orders()` in section 8 returns only IDs
 - `reason` TEXT, check ∈ {stale_entry, exit_legs}
 
 ## 11. Weekly review report
@@ -558,8 +569,8 @@ Build in this order, one branch and pull request per milestone. Post a short pla
 
   **Done when:** `make build && make test` passes locally with one trivial test, and CI is green.
 - **M1: Domain and risk engine.** `models.py`, `risk.py`, `config/policy.yaml` with its loader in `settings.py`, and the full risk unit-test list. **Done when:** all risk tests pass.
-- **M2: Database.** `db/tables.py`, the first Alembic migration, `db/repo.py` (start, finish and fail a run; record helpers; risk-context queries; report queries), and the migration round-trip test. **Done when:** CI's `alembic check` and the integration tests pass.
-- **M3: Offline end to end.** `FakeBroker`, `briefing.py`, `agent.py`, `ScriptedClient`, `run.py`, `report.py`, the CLI, and the remaining unit and integration tests. **Done when:**
+- **M2: Database.** `db/tables.py`, the first Alembic migration, `db/repo.py` (start, finish and fail a run; record helpers; risk-context queries), and the migration round-trip test. **Done when:** CI's `alembic check` and the integration tests pass.
+- **M3: Offline end to end.** `FakeBroker`, `briefing.py`, `agent.py`, `ScriptedClient`, `run.py`, `report.py` with its queries in `repo.py`, the CLI, and the remaining unit and integration tests. The report queries moved here from M2 so they land with `report.py`, their only consumer. **Done when:**
   - `make offline` completes a run that writes every table
   - `make report` renders from it
   - the full test list passes

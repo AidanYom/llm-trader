@@ -50,7 +50,10 @@ jobs:
         run: ruff format --check .
       - name: Type check
         run: mypy
-      # M2 adds: alembic upgrade head, then alembic check (schema drift fails the build).
+      - name: Migrate
+        run: alembic upgrade head
+      - name: Schema drift (fails if db/tables.py and the migrations disagree)
+        run: alembic check
       - name: Tests
         run: pytest -q
 
