@@ -1,0 +1,2 @@
+# The repo lives on Windows but runs in Linux containers: keep every text file LF (HANDOFF §12).
+* text=auto eol=lf

@@ -1,0 +1,31 @@
+# Secrets: only the example file is committed
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+
+# Weekly reports (HANDOFF §11)
+reports/
+
+# Terraform (M5): state lives in S3, never in git
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

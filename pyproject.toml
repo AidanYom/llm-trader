@@ -1,0 +1,50 @@
+[project]
+name = "llm-trader"
+version = "0.1.0"
+description = "Daily pre-market trading agent for one Alpaca account: Claude proposes, a deterministic risk engine decides."
+requires-python = ">=3.12"
+dependencies = [
+    "alembic",
+    "alpaca-py",
+    "anthropic",
+    "boto3",
+    "psycopg[binary]>=3",
+    "pyyaml",
+    "sqlalchemy>=2",
+]
+
+[project.scripts]
+trader = "trader.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "trader"
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.format]
+# Ruff also formats Python snippets inside Markdown. Keep it away from docs and from the prompt
+# files in config/*.md, whose exact text determines prompt_version.
+exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.ruff.lint.isort]
+# CLAUDE.md convention: every module starts with this import. `make fmt` adds it where missing.
+required-imports = ["from __future__ import annotations"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config", "--import-mode=importlib"]
+xfail_strict = true

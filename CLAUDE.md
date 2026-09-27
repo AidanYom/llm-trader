@@ -17,7 +17,7 @@ A weekly markdown report compares results with an equal-weight sector ETF baseli
 
 Keep this section current: update it in the pull request that completes each milestone (HANDOFF §18).
 
-- [ ] M0 Skeleton (Docker, Compose, Makefile, uv, ruff, pytest, CI)
+- [x] M0 Skeleton (Docker, Compose, Makefile, uv, ruff, pytest, CI)
 - [ ] M1 Domain models and risk engine
 - [ ] M2 Database: tables, Alembic, repository, integration tests
 - [ ] M3 Offline end to end: fake broker, briefing, agent loop, run, report, CLI
@@ -84,6 +84,7 @@ make psql         # psql into the dev database
 make lint         # ruff check + ruff format --check
 make fmt          # ruff format + ruff check --fix
 make test         # pytest (unit + integration, uses trader_test DB)
+make lock         # re-lock uv.lock after changing dependencies (uv runs in the container)
 make migrate      # alembic upgrade head (dev DB)
 make revision m="add x"   # alembic autogenerate — review the file by hand
 make offline      # full run with FakeBroker + ScriptedClient
@@ -133,6 +134,7 @@ Before asking for review, `make lint && make test` must pass locally, and CI mus
 ## Git and pull requests
 
 - The default branch is `main`, and it's protected: merge via pull request only, with CI green.
+- Pull requests are squash-merged into `main`. The pull request title must be a Conventional Commit (for example `feat: add risk engine`), because it becomes the commit message on `main`.
 - Branches: `m0-skeleton`, `m1-risk-engine`, `fix/<slug>`, `chore/<slug>`.
 - Commits use Conventional Commits: `feat:`, `fix:`, `test:`, `refactor:`, `docs:`, `chore:`, `ci:`. Keep them small and focused.
 - Update the README when commands or setup change, and this file's Status section when a milestone completes.

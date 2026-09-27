@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: trader
+          POSTGRES_PASSWORD: trader
+          POSTGRES_DB: trader_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U trader -d trader_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      # CI has no dev database: migrations and tests both use trader_test.
+      DATABASE_URL: postgresql+psycopg://trader:trader@localhost:5432/trader_test
+      TEST_DATABASE_URL: postgresql+psycopg://trader:trader@localhost:5432/trader_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.19" # same uv as the Dockerfile
+          enable-cache: true
+          activate-environment: true # puts .venv/bin on PATH for the steps below
+      - name: Install (fails if uv.lock is out of date)
+        run: uv sync --locked
+      - name: Ruff lint
+        run: ruff check .
+      - name: Ruff format
+        run: ruff format --check .
+      # M2 adds: alembic upgrade head, then alembic check (schema drift fails the build).
+      - name: Tests
+        run: pytest -q
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the Lambda image (no push)
+        run: docker build --platform linux/amd64 --target lambda .
