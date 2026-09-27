@@ -10,7 +10,7 @@ A daily trading agent for one small Alpaca account, paper trading first. Every t
 - Docker Desktop, with Docker Compose 2.24 or later
 - GNU make. On Windows, run it from Git Bash or WSL2.
 
-Nothing else goes on the host. Python, uv (the package manager), Ruff (the linter and formatter) and pytest all run in the dev container.
+Nothing else goes on the host. Python, uv (the package manager), Ruff (the linter and formatter), mypy (the type checker) and pytest all run in the dev container.
 
 ## Setup
 
@@ -32,7 +32,7 @@ Each target is a single `docker compose` command. Targets for later milestones f
 | `make down` | Stop the containers (the database volume is kept) | `docker compose down` | M0 |
 | `make shell` | Bash in the app container | `docker compose run --rm app bash` | M0 |
 | `make psql` | psql into the dev database (run `make up` first) | `docker compose exec db psql -U trader -d trader` | M0 |
-| `make lint` | Ruff lint and format checks, as in CI | `docker compose run --rm --no-deps app sh -c "ruff check . && ruff format --check ."` | M0 |
+| `make lint` | Ruff lint and format checks, then mypy type checks, as in CI | `docker compose run --rm --no-deps app sh -c "ruff check . && ruff format --check . && mypy"` | M0 |
 | `make fmt` | Apply Ruff's automatic fixes, then format | `docker compose run --rm --no-deps app sh -c "ruff check --fix . ; ruff format ."` | M0 |
 | `make test` | pytest; integration tests use the `trader_test` database | `docker compose run --rm app pytest` | M0 |
 | `make lock` | Update `uv.lock` after editing dependencies | `docker compose run --rm --no-deps app uv lock` | M0 |
@@ -58,7 +58,7 @@ Dependencies are declared in `pyproject.toml` and pinned in `uv.lock`. To add on
 
 GitHub Actions runs two jobs on every push and on pull requests to `main`. Both must pass before a merge.
 
-- `test` installs from the lock, runs Ruff's lint and format checks, then runs pytest against a Postgres 16 service.
+- `test` installs from the lock, runs Ruff's lint and format checks and mypy, then runs pytest against a Postgres 16 service.
 - `image` builds the Lambda image without pushing it.
 
 ## Windows notes
