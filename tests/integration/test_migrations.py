@@ -10,7 +10,28 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import Connection, text
 
+from trader.db import repo
+from trader.db.repo import SchemaVersionError
 from trader.db.tables import SCHEMA_HEAD, metadata
+
+
+def test_schema_check_passes_at_head(conn: Connection) -> None:
+    repo.check_schema(conn)
+
+
+@pytest.mark.parametrize(
+    ("change", "found"),
+    [
+        ("UPDATE alembic_version SET version_num = '0ld0ld0ld0ld'", "revision 0ld0ld0ld0ld"),
+        ("DELETE FROM alembic_version", "no revision"),
+        ("DROP TABLE alembic_version", "never been migrated"),
+    ],
+)
+def test_schema_check_refuses_any_other_revision(conn: Connection, change: str, found: str) -> None:
+    conn.execute(text(change))  # rolled back when the test ends
+
+    with pytest.raises(SchemaVersionError, match=f"has {found}, but this code needs revision {SCHEMA_HEAD}"):
+        repo.check_schema(conn)
 
 
 def test_migrations_round_trip(conn: Connection, alembic_config: Config) -> None:
