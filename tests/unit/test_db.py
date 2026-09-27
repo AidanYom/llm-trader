@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 import traceback
+from pathlib import Path
 
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 from trader.db.engine import DatabaseUrlError, make_engine, postgres_url
+from trader.db.tables import SCHEMA_HEAD
+
+ALEMBIC_INI = Path(__file__).resolve().parents[2] / "alembic.ini"
+
+
+def test_schema_head_names_the_newest_migration() -> None:
+    heads = ScriptDirectory.from_config(Config(str(ALEMBIC_INI))).get_heads()
+
+    assert heads == [SCHEMA_HEAD], f"set SCHEMA_HEAD in src/trader/db/tables.py to the new revision: {heads}"
 
 
 @pytest.mark.parametrize("scheme", ["postgresql", "postgres", "postgresql+psycopg"])

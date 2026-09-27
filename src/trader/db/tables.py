@@ -8,7 +8,7 @@ tests/integration/test_migrations.py also checks that the migrations build exact
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import (
     BigInteger,
@@ -33,6 +33,10 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 
 from trader.models import CancelReason, OrderStatus, RunMode, RunStatus, Side, VerdictStatus
+
+# The migration revision these tables match. The app refuses to run against a database at any other
+# revision (HANDOFF §9), and tests/unit/test_db.py fails until this names the newest migration.
+SCHEMA_HEAD: Final = "a77d5ab72d60"
 
 # Names every constraint and index, so autogenerate compares them by name and migrations can drop them.
 metadata = MetaData(
