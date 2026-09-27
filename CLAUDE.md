@@ -18,7 +18,7 @@ A weekly markdown report compares results with an equal-weight sector ETF baseli
 Keep this section current: update it in the pull request that completes each milestone (HANDOFF §18).
 
 - [x] M0 Skeleton (Docker, Compose, Makefile, uv, ruff, pytest, CI)
-- [ ] M1 Domain models and risk engine
+- [x] M1 Domain models and risk engine
 - [ ] M2 Database: tables, Alembic, repository, integration tests
 - [ ] M3 Offline end to end: fake broker, briefing, agent loop, run, report, CLI
 - [ ] M4 Real Alpaca and Anthropic locally (`make smoke`, `make dry-run`)
@@ -57,8 +57,8 @@ Keep this section current: update it in the pull request that completes each mil
 
 | Path | Responsibility | Rules |
 |---|---|---|
-| `src/trader/models.py` | Domain dataclasses (Proposal, Position, AccountState, Bar, NewsItem, SymbolStats, Order, Verdict, RiskContext) | No I/O, no SDK imports |
-| `src/trader/risk.py` | Risk engine: `evaluate(proposals, account, stats, ctx)` | Pure and deterministic; never raises on bad proposals; every trim or reject has a reason string |
+| `src/trader/models.py` | Domain dataclasses (Proposal, Position, AccountState, Bar, NewsItem, SymbolStats, Order, Verdict, RiskContext, Policy) | No I/O, no SDK imports; `Order` and `Verdict` check their own invariants |
+| `src/trader/risk.py` | Risk engine: `evaluate(proposals, account, stats, ctx, policy)` | Pure and deterministic; never raises on bad proposals; every trim or reject has a `category: detail` reason (HANDOFF §7) |
 | `src/trader/briefing.py` | Briefing markdown, return math, `get_price_history` text | Pure functions |
 | `src/trader/agent.py` | Tool definitions, the Claude loop, proposal parsing, cost | The only module that calls the Anthropic SDK |
 | `src/trader/brokers/` | `Broker` protocol; `alpaca.py`; `fake.py` | The only place alpaca-py is imported |
