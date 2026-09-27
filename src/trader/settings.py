@@ -4,6 +4,8 @@ globally.
 `load_config()` reads `config/policy.yaml`, `config/strategy.yaml` and the two prompt files, and assembles the
 system prompt and its version. The paths are relative to the working directory (HANDOFF §13): /app in the dev
 container, /var/task in the Lambda image.
+
+`Secrets` resolves the API keys and the database URL from the environment, or from SSM in Lambda.
 """
 
 from __future__ import annotations
@@ -11,11 +13,11 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import yaml
 
@@ -71,6 +73,76 @@ def assemble_system_prompt(system_frame: str, strategy: str) -> str:
 def prompt_version(system_prompt: str) -> str:
     """The first 10 hex characters of the prompt's SHA-256 (HANDOFF §4)."""
     return hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:10]
+
+
+# ---- The environment --------------------------------------------------------------------------------------
+
+
+class SecretError(RuntimeError):
+    """A secret is set nowhere, or SSM couldn't return it. Messages name the secret, never a value."""
+
+
+class SsmClient(Protocol):
+    """The one call Secrets makes on boto3's SSM client."""
+
+    def get_parameter(self, *, Name: str, WithDecryption: bool) -> Mapping[str, Any]: ...
+
+
+class Secrets:
+    """Secrets such as ANTHROPIC_API_KEY and DATABASE_URL, each resolved once per process (HANDOFF §13).
+
+    For a secret NAME: the environment variable NAME if it's set and not blank; otherwise the SSM SecureString
+    parameter that NAME_SSM names, decrypted. A blank NAME counts as unset, because an empty line in .env,
+    such as `ANTHROPIC_API_KEY=`, still sets the variable.
+    """
+
+    def __init__(self, environ: Mapping[str, str], ssm: Callable[[], SsmClient] | None = None) -> None:
+        self._environ = environ
+        self._make_ssm = ssm or _boto3_ssm
+        self._ssm: SsmClient | None = None
+        self._resolved: dict[str, str] = {}
+
+    def get(self, name: str) -> str:
+        if name not in self._resolved:
+            self._resolved[name] = self._environ.get(name, "").strip() or self._from_ssm(name)
+        return self._resolved[name]
+
+    def _from_ssm(self, name: str) -> str:
+        parameter = self._environ.get(f"{name}_SSM", "").strip()
+        if not parameter:
+            raise SecretError(
+                f"{name} is not set: set it in .env, or set {name}_SSM to an SSM parameter name"
+            )
+        if self._ssm is None:
+            self._ssm = self._make_ssm()
+        try:
+            value = self._ssm.get_parameter(Name=parameter, WithDecryption=True)["Parameter"]["Value"]
+        except Exception as exc:  # whatever failed, the secret is unavailable
+            # boto3's error messages name the parameter and the error code, never the value.
+            problem = f"{type(exc).__name__}: {exc}"
+            raise SecretError(f"{name}: can't read SSM parameter {parameter}: {problem}") from exc
+        if not isinstance(value, str) or not value.strip():
+            raise SecretError(f"{name}: SSM parameter {parameter} is empty")
+        return value.strip()
+
+
+def _boto3_ssm() -> SsmClient:
+    # Imported here, so local runs and tests never load boto3. It ships without type hints, and this one call
+    # doesn't justify adding boto3-stubs as a dependency.
+    import boto3  # type: ignore[import-untyped]
+
+    client: SsmClient = boto3.client("ssm")
+    return client
+
+
+def alpaca_paper(environ: Mapping[str, str]) -> bool:
+    """ALPACA_PAPER: true when unset (HANDOFF §8). Only true and false are accepted: a typo can't go live."""
+    value = environ.get("ALPACA_PAPER", "").strip().lower()
+    if value in ("", "true"):
+        return True
+    if value == "false":
+        return False
+    raise ConfigError(f"ALPACA_PAPER must be true or false, got {value!r}")
 
 
 # A number's allowed range: the check, and how an error message describes it.

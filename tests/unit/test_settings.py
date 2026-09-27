@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import re
 import shutil
+from collections.abc import Mapping
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from trader.settings import (
     PROMPT_SEPARATOR,
     ConfigError,
+    SecretError,
+    Secrets,
+    SsmClient,
+    alpaca_paper,
     assemble_system_prompt,
     load_config,
     load_policy,
@@ -226,3 +232,97 @@ def test_missing_prompt_file_is_reported(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match=r"missing\.md: can't read the file"):
         load_config(root)
+
+
+# ---- Secrets and ALPACA_PAPER -----------------------------------------------------------------------------
+
+
+class FakeSsm:
+    """Stands in for boto3's SSM client, recording each parameter it's asked for."""
+
+    def __init__(self, parameters: Mapping[str, str]) -> None:
+        self.parameters = parameters
+        self.requests: list[tuple[str, bool]] = []
+
+    def get_parameter(self, *, Name: str, WithDecryption: bool) -> Mapping[str, Any]:
+        self.requests.append((Name, WithDecryption))
+        if Name not in self.parameters:
+            raise LookupError(f"ParameterNotFound: {Name}")
+        return {"Parameter": {"Name": Name, "Value": self.parameters[Name]}}
+
+
+def no_ssm() -> SsmClient:
+    raise AssertionError("SSM must not be called")
+
+
+def test_environment_variable_wins() -> None:
+    secrets = Secrets({"ANTHROPIC_API_KEY": "sk-env", "ANTHROPIC_API_KEY_SSM": "/llm-trader/X"}, ssm=no_ssm)
+
+    assert secrets.get("ANTHROPIC_API_KEY") == "sk-env"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_environment_variable_falls_back_to_ssm(blank: str) -> None:
+    ssm = FakeSsm({"/llm-trader/ANTHROPIC_API_KEY": "sk-ssm"})
+    environ = {"ANTHROPIC_API_KEY": blank, "ANTHROPIC_API_KEY_SSM": "/llm-trader/ANTHROPIC_API_KEY"}
+
+    assert Secrets(environ, ssm=lambda: ssm).get("ANTHROPIC_API_KEY") == "sk-ssm"
+    assert ssm.requests == [("/llm-trader/ANTHROPIC_API_KEY", True)]  # decrypted
+
+
+def test_each_secret_is_read_from_ssm_once() -> None:
+    ssm = FakeSsm({"/llm-trader/DATABASE_URL": "postgresql://db", "/llm-trader/ANTHROPIC_API_KEY": "sk"})
+    clients: list[FakeSsm] = []
+
+    def make_ssm() -> SsmClient:
+        clients.append(ssm)
+        return ssm
+
+    secrets = Secrets(
+        {
+            "DATABASE_URL_SSM": "/llm-trader/DATABASE_URL",
+            "ANTHROPIC_API_KEY_SSM": "/llm-trader/ANTHROPIC_API_KEY",
+        },
+        ssm=make_ssm,
+    )
+    for _ in range(2):
+        assert secrets.get("DATABASE_URL") == "postgresql://db"
+        assert secrets.get("ANTHROPIC_API_KEY") == "sk"
+
+    assert len(ssm.requests) == 2
+    assert len(clients) == 1
+
+
+def test_secret_set_nowhere_names_both_variables() -> None:
+    with pytest.raises(
+        SecretError, match="ALPACA_API_KEY is not set: set it in .env, or set ALPACA_API_KEY_SSM"
+    ):
+        Secrets({"ALPACA_API_KEY": ""}, ssm=no_ssm).get("ALPACA_API_KEY")
+
+
+def test_ssm_failure_names_the_parameter() -> None:
+    secrets = Secrets({"DATABASE_URL_SSM": "/llm-trader/DATABASE_URL"}, ssm=lambda: FakeSsm({}))
+
+    with pytest.raises(SecretError, match="DATABASE_URL: can't read SSM parameter /llm-trader/DATABASE_URL"):
+        secrets.get("DATABASE_URL")
+
+
+def test_empty_ssm_parameter_is_refused() -> None:
+    secrets = Secrets({"DATABASE_URL_SSM": "/p"}, ssm=lambda: FakeSsm({"/p": " "}))
+
+    with pytest.raises(SecretError, match="SSM parameter /p is empty"):
+        secrets.get("DATABASE_URL")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, True), ("", True), ("true", True), ("TRUE ", True), ("false", False), ("False", False)],
+)
+def test_alpaca_paper_defaults_to_true(value: str | None, expected: bool) -> None:
+    assert alpaca_paper({} if value is None else {"ALPACA_PAPER": value}) is expected
+
+
+@pytest.mark.parametrize("value", ["yes", "0", "live", "fasle"])
+def test_alpaca_paper_refuses_anything_but_true_or_false(value: str) -> None:
+    with pytest.raises(ConfigError, match="ALPACA_PAPER must be true or false"):
+        alpaca_paper({"ALPACA_PAPER": value})

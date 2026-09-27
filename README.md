@@ -97,6 +97,15 @@ The values are Aidan's; the file holds the current ones, and its comments explai
 
 The system prompt is `config/system_frame.md`, a `---` separator, then `config/strategy.md` with its HTML comments removed. Its version, the first 10 hex characters of its SHA-256, is recorded with every run, and the `prompt_versions` table keeps each version's full text. Any edit to either file starts a new version, which is how results are attributed to prompts. `strategy.md` is Aidan's.
 
+### Secrets and environment
+
+The app reads `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ANTHROPIC_API_KEY` and `DATABASE_URL` when it needs them, once per process:
+
+- For a secret `NAME`, it uses the environment variable `NAME` when it's set and not blank. Locally that's `.env`, or `docker-compose.yml` for `DATABASE_URL`. An empty line in `.env`, such as `ANTHROPIC_API_KEY=`, counts as unset.
+- Otherwise it reads the SSM SecureString parameter that `NAME_SSM` names. That's how the Lambda function gets them (M5).
+
+`ALPACA_PAPER` must be `true` (the default when unset) or `false`. Anything else stops the app, so a typo can't point it at a live account.
+
 ## Database
 
 Postgres 16 records every run: its briefing, tool calls, proposals, verdicts, orders and cost (HANDOFF §10).
