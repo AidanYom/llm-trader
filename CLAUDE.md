@@ -18,7 +18,7 @@ A weekly markdown report compares results with an equal-weight sector ETF baseli
 Keep this section current: update it in the pull request that completes each milestone (HANDOFF §18).
 
 - [x] M0 Skeleton (Docker, Compose, Makefile, uv, ruff, pytest, CI)
-- [ ] M1 Domain models and risk engine
+- [x] M1 Domain models and risk engine
 - [ ] M2 Database: tables, Alembic, repository, integration tests
 - [ ] M3 Offline end to end: fake broker, briefing, agent loop, run, report, CLI
 - [ ] M4 Real Alpaca and Anthropic locally (`make smoke`, `make dry-run`)
@@ -57,8 +57,8 @@ Keep this section current: update it in the pull request that completes each mil
 
 | Path | Responsibility | Rules |
 |---|---|---|
-| `src/trader/models.py` | Domain dataclasses (Proposal, Position, AccountState, Bar, NewsItem, SymbolStats, Order, Verdict, RiskContext) | No I/O, no SDK imports |
-| `src/trader/risk.py` | Risk engine: `evaluate(proposals, account, stats, ctx)` | Pure and deterministic; never raises on bad proposals; every trim or reject has a reason string |
+| `src/trader/models.py` | Domain dataclasses (Proposal, Position, AccountState, Bar, NewsItem, SymbolStats, Order, Verdict, RiskContext, Policy) | No I/O, no SDK imports; `Order` and `Verdict` check their own invariants |
+| `src/trader/risk.py` | Risk engine: `evaluate(proposals, account, stats, ctx, policy)` | Pure and deterministic; never raises on bad proposals; every trim or reject has a `category: detail` reason (HANDOFF §7) |
 | `src/trader/briefing.py` | Briefing markdown, return math, `get_price_history` text | Pure functions |
 | `src/trader/agent.py` | Tool definitions, the Claude loop, proposal parsing, cost | The only module that calls the Anthropic SDK |
 | `src/trader/brokers/` | `Broker` protocol; `alpaca.py`; `fake.py` | The only place alpaca-py is imported |
@@ -81,7 +81,7 @@ make build        # build images
 make up / down    # start/stop Postgres
 make shell        # shell in the app container
 make psql         # psql into the dev database
-make lint         # ruff check + ruff format --check
+make lint         # ruff check + ruff format --check + mypy
 make fmt          # ruff format + ruff check --fix
 make test         # pytest (unit + integration, uses trader_test DB)
 make lock         # re-lock uv.lock after changing dependencies (uv runs in the container)
@@ -100,6 +100,7 @@ Before asking for review, `make lint && make test` must pass locally, and CI mus
 
 - **Python 3.12** with type hints on every function signature. Use `X | None`, built-in generics and `from __future__ import annotations`.
 - **Ruff** does both linting and formatting: line length 110, rule sets `E, F, I, B, UP, SIM`. Don't add `noqa` without a comment explaining why.
+- **mypy** checks the type hints in strict mode: every function fully annotated, no implicit `Any`. Don't add `# type: ignore` without a comment explaining why.
 - **Domain types** are dataclasses in `models.py`. Sizing math uses floats; prices on orders are rounded to cents when the risk engine creates the `Order`. Convert to and from `Decimal` only at the `repo.py` boundary (the database uses NUMERIC).
 - **Keep I/O at the edges.** Only `brokers/`, `db/`, the SDK call in `agent.py`, and `run.py` touch the outside world. Keep `risk.py` and `briefing.py` pure so they stay trivially testable.
 - **Time must be timezone-aware.** `run_date` is the America/New_York date; stored timestamps are UTC `TIMESTAMPTZ`. Never call naive `datetime.now()`. Inject `now` into `run_daily` so tests can pin it.

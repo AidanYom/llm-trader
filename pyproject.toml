@@ -18,8 +18,10 @@ trader = "trader.__main__:main"
 
 [dependency-groups]
 dev = [
+    "mypy",
     "pytest",
     "ruff",
+    "types-PyYAML",
 ]
 
 [build-system]
@@ -43,6 +45,15 @@ select = ["E", "F", "I", "B", "UP", "SIM"]
 [tool.ruff.lint.isort]
 # CLAUDE.md convention: every module starts with this import. `make fmt` adds it where missing.
 required-imports = ["from __future__ import annotations"]
+
+[tool.mypy]
+# Type-checks the hints (CLAUDE.md). Strict: every function fully annotated, no implicit Any.
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+# Name modules from src/ and the repo root, so tests/unit/x.py and tests/integration/x.py can't collide.
+mypy_path = "src"
+explicit_package_bases = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

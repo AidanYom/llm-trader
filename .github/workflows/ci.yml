@@ -48,6 +48,8 @@ jobs:
         run: ruff check .
       - name: Ruff format
         run: ruff format --check .
+      - name: Type check
+        run: mypy
       # M2 adds: alembic upgrade head, then alembic check (schema drift fails the build).
       - name: Tests
         run: pytest -q

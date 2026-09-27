@@ -1,0 +1,22 @@
+trading_enabled: true          # kill switch: false = research, evaluate and persist, but submit nothing
+allow_live_money: false        # must be true before the app runs against a non-paper Alpaca account
+
+max_position_pct: 8            # max % of equity in one symbol (existing holding included)
+max_open_positions: 6
+max_new_positions_per_week: 4  # new symbols opened Mon–Sun; adding to a holding doesn't count
+min_cash_buffer_pct: 5         # never spend the last 5% of equity on buys
+
+min_price: 5.00
+min_avg_dollar_volume: 5000000 # 20-session mean of close × volume (SIP)
+max_pct_of_adv: 1.0            # order notional ≤ 1% of that average
+
+entry_limit_buffer_pct: 1.0    # buy limit = last close + 1%
+stop:
+  required: true
+  min_pct: 3
+  max_pct: 15
+
+drawdown_freeze_pct: 15        # equity this far below peak → buys rejected (sells allowed)
+drawdown_peak_since: null      # ISO date; ignore earlier equity history (set at go-live or after a paper reset)
+
+blocked_symbols: [TQQQ, SQQQ, SOXL, SOXS, UVXY, SVXY, SPXL, SPXS, TSLL, NVDL, LABU, LABD, TNA, TZA, UPRO, SPXU]

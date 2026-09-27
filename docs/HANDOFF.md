@@ -123,12 +123,18 @@ The data behind it:
 
 ## 7. Risk engine
 
-`trader/risk.py` is pure and deterministic, with no I/O. Its signature is `evaluate(proposals, account, stats, ctx) -> list[Verdict]`.
+`trader/risk.py` is pure and deterministic, with no I/O. Its signature is `evaluate(proposals, account, stats, ctx, policy) -> list[Verdict]`.
 
 - Verdicts come back in the same order as the proposals.
-- The engine never raises on bad input.
-- **Normalization:** symbols are stripped and uppercased. Sells are evaluated before buys, so they free position slots. A second proposal for an already-seen symbol is rejected as a duplicate.
+- The engine never raises on bad input:
+  - A missing or unusable number in a proposal (None, NaN, an infinity, a string) rejects it with a reason.
+  - If the account or `ctx` can't be sized against, every buy is rejected with an `account:` or `risk context:` reason. That covers equity that isn't a positive number, cash or a position's market value that isn't a number, and an unusable peak or weekly count. Sells are still evaluated.
+- **Normalization:**
+  - Symbols are stripped and uppercased, then must pass the tools' rule from section 5 (`normalize_symbol()` in `models.py`); otherwise the proposal is rejected. An action other than buy or sell is rejected too.
+  - Sells are evaluated before buys, so they free position slots. Each side keeps the proposals' order.
+  - A second proposal for an already-seen symbol, in that evaluation order, is rejected as a duplicate. So a sell beats a buy for the same symbol.
 - **`ctx`** carries `new_positions_this_week` and `equity_peak`, both from Postgres (section 9).
+- **`policy`** is the `Policy` that `settings.load_policy()` reads from `config/policy.yaml`. It's a parameter because config is loaded once and passed down, never read globally.
 
 **Sell:** the symbol must be held (otherwise reject: long-only, no shorting). `qty = floor(held qty)` and must be ≥ 1. The verdict is `approved` with a market-order exit and the reason "full exit".
 
@@ -136,11 +142,11 @@ The data behind it:
 
 1. **Drawdown freeze:** if `equity < max(equity_peak, equity) × (1 − drawdown_freeze_pct/100)`, reject. Sells stay allowed during a freeze.
 2. **Blocklist:** the symbol is in `blocked_symbols`.
-3. **Market data:** no stats for the symbol.
+3. **Market data:** no stats for the symbol, or stats without a usable last close and average dollar volume.
 4. **Price:** `last_close < min_price`.
 5. **Liquidity:** `avg_dollar_volume_20d < min_avg_dollar_volume`, where the average is the mean of close × volume over the last 20 sessions.
-6. **Stop:** `stop_pct` is missing (when `stop.required`) or outside `[stop.min_pct, stop.max_pct]`.
-7. **Target:** `target_pct ≤ 0`.
+6. **Stop:** `stop_pct` is missing or outside `[stop.min_pct, stop.max_pct]`. Every buy needs a stop (CLAUDE.md invariant 3), and the policy loader refuses `stop.required: false`.
+7. **Target:** `target_pct` is missing or ≤ 0.
 8. **New-position limits** (when the symbol isn't already held):
    - the open positions this run would leave (`current − approved exits + approved new`) are already at `max_open_positions`
    - `ctx.new_positions_this_week + approved new this run` is already at `max_new_positions_per_week`
@@ -148,13 +154,18 @@ The data behind it:
 10. **Position cap:** `room = max_position_pct% × equity − existing`. If room ≤ 0, reject. If notional exceeds room, trim to room.
 11. **Liquidity cap:** if notional exceeds `max_pct_of_adv% × avg_dollar_volume_20d`, trim to it.
 12. **Cash:** `available = cash − min_cash_buffer_pct% × equity − cash committed by earlier approved buys this run`. If available ≤ 0, reject. If notional exceeds available, trim to it.
-13. **Shares:** `limit = round(last_close × (1 + entry_limit_buffer_pct/100), 2)` and `qty = floor(notional / limit)`. If qty < 1, reject as "size below one share".
+13. **Shares:** `limit = round(last_close × (1 + entry_limit_buffer_pct/100), 2)` and `qty = floor(notional / limit)`. If qty < 1, reject as "size below one share". (A limit that rounds below $0.01 is rejected under `price`; only a near-zero `min_price` allows one.)
 14. **Protective prices:**
     - `stop_price = round(last_close × (1 − stop_pct/100), 2)`.
-    - When `take_profit_pct` is given, `tp_price = round(last_close × (1 + take_profit_pct/100), 2)`. It is kept only if it's ≥ `limit + 0.01`; otherwise drop it and add the reason "take-profit dropped: not above the entry limit".
-15. **Result:** the status is `trimmed` if any trim applied, otherwise `approved`. Add `qty × limit` to committed cash, and count a new position if applicable. The verdict's `opens_new_position` is true when the symbol wasn't held.
+    - When `take_profit_pct` is given, `tp_price = round(last_close × (1 + take_profit_pct/100), 2)`. It is kept only if it's ≥ `limit + 0.01`; otherwise drop it and add the reason "take-profit dropped: not above the entry limit". Dropping a take-profit isn't a trim.
+    - Prices are compared in whole cents, not as floats.
+    - A defensive check rejects the buy unless `stop_price` is at least $0.01 and below the limit. It can't fire with a sane policy; it keeps any policy value from producing an order Alpaca would reject.
+15. **Result:** the status is `trimmed` if any trim applied, otherwise `approved`. Add `qty × limit` to committed cash, and count a new position if applicable. The verdict's `opens_new_position` is true for an approved or trimmed buy of a symbol that wasn't held.
 
-Every trim and rejection carries a human-readable reason; the weekly report groups them.
+**Reasons:**
+- Every trim and rejection carries a reason of the form `category: detail`, for example `liquidity: 20d avg dollar volume $4.90M is below $5.00M`.
+- The category is a fixed lowercase label with no colon, and the weekly report groups rejections by it (section 11). The categories, roughly in the order they can fire, are `symbol`, `action`, `duplicate`, `not held`, `account`, `risk context`, `drawdown freeze`, `blocklist`, `market data`, `price`, `liquidity`, `stop`, `target`, `max open positions`, `weekly limit`, `position cap`, `liquidity cap`, `cash` and `size` (under one share, for a sell or a buy).
+- An approved sell carries `full exit`, and a dropped take-profit adds `take-profit dropped: …`. A buy approved with no trims has no reasons.
 
 ## 8. Broker: Alpaca
 
@@ -369,7 +380,7 @@ Aidan reads the report in his Claude Project. The bot never uses MCP. For ad-hoc
 - **Python:** 3.12, pinned in `.python-version`.
 - **Packages:** **uv** with `pyproject.toml` and a committed `uv.lock`. Use a src layout and expose a `trader` console script.
 - **Runtime dependencies:** `alpaca-py`, `anthropic`, `sqlalchemy>=2`, `alembic`, `psycopg[binary]>=3`, `pyyaml`, `boto3`.
-- **Dev dependencies:** `pytest`, `ruff`.
+- **Dev dependencies:** `pytest`, `ruff`, `mypy` (strict type checking, added in M1), and `types-PyYAML` (PyYAML's type hints for mypy).
 - **CLI:** argparse subcommands: `trader run --mode … [--force] [--show-briefing]`, `trader report [--days N] [--no-baseline]`, `trader smoke`.
 - **Default branch:** `main`. Rename the empty `master` before the first commit.
 - **`.gitattributes`:** `* text=auto eol=lf`. The repo lives on Windows and must stay LF for the Linux containers.
@@ -398,7 +409,7 @@ Aidan reads the report in his Claude Project. The bot never uses MCP. For ad-hoc
 │   ├── __main__.py              # CLI
 │   ├── settings.py              # config + prompt assembly + secrets (env, then *_SSM)
 │   ├── models.py                # dataclasses: Proposal, Position, AccountState, Bar, NewsItem,
-│   │                            #   SymbolStats, Order, Verdict, RiskContext
+│   │                            #   SymbolStats, Order, Verdict, RiskContext, Policy
 │   ├── risk.py
 │   ├── briefing.py
 │   ├── agent.py                 # tools, loop, parsing, cost
@@ -438,7 +449,7 @@ Everything runs in Docker; nothing uses the host's Python.
 
 **Makefile** (each target is a one-line `docker compose` command; on Windows, run `make` from WSL2 or Git Bash with make installed):
 - `build`, `up`, `down`, `shell`, `psql`
-- `lint` (`ruff check` + `ruff format --check`), `fmt`, `test`
+- `lint` (`ruff check` + `ruff format --check` + `mypy`), `fmt`, `test`
 - `migrate` (`alembic upgrade head`), `revision m="…"` (autogenerate)
 - `offline`, `dry-run`, `submit`, `report`, `smoke`
 - added in milestone 5: `image`, `push`, `deploy`, `migrate-prod`
@@ -482,7 +493,7 @@ Everything runs in Docker; nothing uses the host's Python.
 - **Job `test`** (ubuntu-latest):
   1. Start a `postgres:16` service container with a health check.
   2. `astral-sh/setup-uv` with caching, then `uv sync --frozen`.
-  3. `ruff check .` and `ruff format --check .`.
+  3. `ruff check .`, `ruff format --check .` and `mypy`.
   4. `alembic upgrade head` and `alembic check` (schema drift fails the build).
   5. `pytest -q`.
 - **Job `image`:** `docker build --platform linux/amd64 --target lambda .`, with no push.
@@ -546,13 +557,13 @@ Build in this order, one branch and pull request per milestone. Post a short pla
   - a README skeleton and the CI workflow
 
   **Done when:** `make build && make test` passes locally with one trivial test, and CI is green.
-- **M1: Domain and risk engine.** `models.py`, `risk.py`, `config/policy.yaml`, and the full risk unit-test list. **Done when:** all risk tests pass.
+- **M1: Domain and risk engine.** `models.py`, `risk.py`, `config/policy.yaml` with its loader in `settings.py`, and the full risk unit-test list. **Done when:** all risk tests pass.
 - **M2: Database.** `db/tables.py`, the first Alembic migration, `db/repo.py` (start, finish and fail a run; record helpers; risk-context queries; report queries), and the migration round-trip test. **Done when:** CI's `alembic check` and the integration tests pass.
 - **M3: Offline end to end.** `FakeBroker`, `briefing.py`, `agent.py`, `ScriptedClient`, `run.py`, `report.py`, the CLI, and the remaining unit and integration tests. **Done when:**
   - `make offline` completes a run that writes every table
   - `make report` renders from it
   - the full test list passes
-- **M4: Real services, local.** `brokers/alpaca.py`, the Anthropic client wiring, and `smoke.py`. Aidan adds keys and runs `make smoke`, then several `make dry-run` runs. Fix any adapter mismatches the smoke command finds. **Done when:** smoke passes and dry runs produce sensible briefings and verdicts.
+- **M4: Real services, local.** `brokers/alpaca.py`, the Anthropic client wiring, and `smoke.py`. M4 also rejects buys of leveraged and inverse ETFs by their Alpaca asset name, because `blocked_symbols` can't list every such product; the name patterns become a new policy setting that Aidan approves. Aidan adds keys and runs `make smoke`, then several `make dry-run` runs. Fix any adapter mismatches the smoke command finds. **Done when:** smoke passes and dry runs produce sensible briefings and verdicts.
 - **M5: Production.** The Lambda image target, `infra/` Terraform, the Neon project, SSM parameters, `make deploy` and `migrate-prod`, and the error alarm. **Done when:**
   - the scheduled Lambda completes a dry run against Neon
   - a forced error sends the alarm email

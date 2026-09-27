@@ -19,7 +19,7 @@ psql:
 	docker compose exec db psql -U trader -d trader
 
 lint:
-	docker compose run --rm --no-deps app sh -c "ruff check . && ruff format --check ."
+	docker compose run --rm --no-deps app sh -c "ruff check . && ruff format --check . && mypy"
 
 fmt:
 	docker compose run --rm --no-deps app sh -c "ruff check --fix . ; ruff format ."

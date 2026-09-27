@@ -10,7 +10,7 @@ A daily trading agent for one small Alpaca account, paper trading first. Every t
 - Docker Desktop, with Docker Compose 2.24 or later
 - GNU make. On Windows, run it from Git Bash or WSL2.
 
-Nothing else goes on the host. Python, uv (the package manager), Ruff (the linter and formatter) and pytest all run in the dev container.
+Nothing else goes on the host. Python, uv (the package manager), Ruff (the linter and formatter), mypy (the type checker) and pytest all run in the dev container.
 
 ## Setup
 
@@ -32,7 +32,7 @@ Each target is a single `docker compose` command. Targets for later milestones f
 | `make down` | Stop the containers (the database volume is kept) | `docker compose down` | M0 |
 | `make shell` | Bash in the app container | `docker compose run --rm app bash` | M0 |
 | `make psql` | psql into the dev database (run `make up` first) | `docker compose exec db psql -U trader -d trader` | M0 |
-| `make lint` | Ruff lint and format checks, as in CI | `docker compose run --rm --no-deps app sh -c "ruff check . && ruff format --check ."` | M0 |
+| `make lint` | Ruff lint and format checks, then mypy type checks, as in CI | `docker compose run --rm --no-deps app sh -c "ruff check . && ruff format --check . && mypy"` | M0 |
 | `make fmt` | Apply Ruff's automatic fixes, then format | `docker compose run --rm --no-deps app sh -c "ruff check --fix . ; ruff format ."` | M0 |
 | `make test` | pytest; integration tests use the `trader_test` database | `docker compose run --rm app pytest` | M0 |
 | `make lock` | Update `uv.lock` after editing dependencies | `docker compose run --rm --no-deps app uv lock` | M0 |
@@ -52,13 +52,35 @@ Dependencies are declared in `pyproject.toml` and pinned in `uv.lock`. To add on
 
 ## Configuration
 
-`config/` arrives in M1. Each setting is documented here when it's added.
+Settings live in `config/`. `src/trader/settings.py` reads them once at startup, and the app refuses to start if a file has an unknown, missing or unusable key. Each setting is documented here when it's added.
+
+### `config/policy.yaml`: risk limits and switches
+
+The values are Aidan's; the file holds the current ones, and its comments explain them. Percentages are of account equity unless the table says otherwise.
+
+| Setting | What it does | Read by |
+|---|---|---|
+| `trading_enabled` | Kill switch. When `false`, runs still research, evaluate and record, but send no orders. | run (M3) |
+| `allow_live_money` | Must be `true` before the app will run against a non-paper Alpaca account. | run (M3) |
+| `max_position_pct` | The most one symbol may hold, existing holding included. Larger buys are trimmed to fit. | risk engine |
+| `max_open_positions` | The most positions open at once. Exits approved in the same run free their slots. | risk engine |
+| `max_new_positions_per_week` | New symbols opened per week, Monday to Sunday. Adding to a holding doesn't count. | risk engine |
+| `min_cash_buffer_pct` | Cash that buys never spend. Proceeds from sales in the same run never fund buys. | risk engine |
+| `min_price` | The lowest last close, in dollars, a buy may have. | risk engine |
+| `min_avg_dollar_volume` | The lowest 20-session average of close × volume, in dollars, a buy may have. | risk engine |
+| `max_pct_of_adv` | The largest buy, as a % of that average. Larger buys are trimmed. | risk engine |
+| `entry_limit_buffer_pct` | Buys are limit orders at the last close plus this %. | risk engine |
+| `stop.required` | Must be `true`: every buy carries a protective stop. | settings |
+| `stop.min_pct`, `stop.max_pct` | The allowed stop distance below the last close, in %. | risk engine |
+| `drawdown_freeze_pct` | When equity is this far below its peak, buys are rejected. Sells still go through. | risk engine |
+| `drawdown_peak_since` | A date: only equity from then on counts toward the peak. `null` uses all history. Set it at go-live or after a paper reset. | database (M2) |
+| `blocked_symbols` | Tickers that can never be bought. Quote any that YAML would read as true, false or null, such as `'ON'`. | risk engine |
 
 ## CI
 
 GitHub Actions runs two jobs on every push and on pull requests to `main`. Both must pass before a merge.
 
-- `test` installs from the lock, runs Ruff's lint and format checks, then runs pytest against a Postgres 16 service.
+- `test` installs from the lock, runs Ruff's lint and format checks and mypy, then runs pytest against a Postgres 16 service.
 - `image` builds the Lambda image without pushing it.
 
 ## Windows notes

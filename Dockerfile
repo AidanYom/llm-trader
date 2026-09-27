@@ -40,5 +40,5 @@ RUN --mount=from=uv,source=/uv,target=/bin/uv \
 FROM public.ecr.aws/lambda/python:3.12 AS lambda
 COPY --from=lambda-deps ${LAMBDA_TASK_ROOT} ${LAMBDA_TASK_ROOT}
 COPY src/trader ${LAMBDA_TASK_ROOT}/trader
-# `COPY config/ ...` is added by the milestone that creates config/.
+COPY config/ ${LAMBDA_TASK_ROOT}/config/
 CMD ["trader.lambda_handler.handler"]
