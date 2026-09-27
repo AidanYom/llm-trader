@@ -31,6 +31,33 @@ class VerdictStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class RunMode(StrEnum):
+    """How a run treats orders (HANDOFF §9). The CLI spells DRY_RUN as `dry-run`."""
+
+    OFFLINE = "offline"  # FakeBroker and a scripted model
+    DRY_RUN = "dry_run"  # real broker and model; orders recorded, never sent
+    SUBMIT = "submit"
+
+
+class RunStatus(StrEnum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    SKIPPED = "skipped"  # stopped before doing anything: market closed, or already ran today
+    FAILED = "failed"
+    ABANDONED = "abandoned"  # a stale running row, closed by --force
+
+
+class OrderStatus(StrEnum):
+    SUBMITTED = "submitted"  # the broker accepted it
+    NOT_SUBMITTED = "not_submitted"  # a dry run or the kill switch: recorded, never sent
+    ERROR = "error"  # the broker call failed or the broker refused the order
+
+
+class CancelReason(StrEnum):
+    STALE_ENTRY = "stale_entry"  # an earlier run's unfilled entry, cancelled at the start of a submit run
+    EXIT_LEGS = "exit_legs"  # a position's stop and take-profit legs, cancelled before its exit
+
+
 def normalize_symbol(raw: object) -> str | None:
     """The ticker stripped and uppercased, or None unless it's 1–10 ASCII letters, digits and dots."""
     if not isinstance(raw, str):
@@ -198,6 +225,17 @@ class RiskContext:
 
     new_positions_this_week: int = 0
     equity_peak: float | None = None  # the highest snapshot equity; None before there is any history
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Usage:
+    """A run's token usage, summed across its model turns, and what it cost (HANDOFF §5)."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost_usd: float = 0.0
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
