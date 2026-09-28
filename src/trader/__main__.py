@@ -12,7 +12,9 @@ import os
 import sys
 from pathlib import Path
 
+from trader.agent import ModelClient, anthropic_client
 from trader.brokers.alpaca import AlpacaBroker
+from trader.brokers.base import Broker
 from trader.db.engine import DatabaseUrlError, make_engine
 from trader.db.repo import SchemaVersionError
 from trader.logs import configure_logging
@@ -56,7 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         required=True,
         choices=["offline", "dry-run", "submit"],
-        help="offline: FakeBroker and a scripted model; dry-run: no orders; submit: real orders",
+        help="offline: FakeBroker and a scripted model; dry-run: Alpaca and Claude, but no orders; "
+        "submit: real orders",
     )
     run.add_argument(
         "--force", action="store_true", help="first abandon today's stale running submit run (submit mode)"
@@ -151,17 +154,19 @@ def _alpaca(secrets: Secrets) -> AlpacaBroker:
 
 def _run(args: argparse.Namespace) -> int:
     mode = RunMode(args.mode.replace("-", "_"))
-    if mode is not RunMode.OFFLINE:
-        print(
-            f"trader: --mode {args.mode} needs the Alpaca adapter and the Claude client (M4)", file=sys.stderr
-        )
-        return 2
     config = load_config(Path.cwd())
-    broker = offline_broker(utc_now(), paper=alpaca_paper(os.environ))
-    engine = make_engine(Secrets(os.environ).get("DATABASE_URL"))
+    secrets = Secrets(os.environ)
+    broker: Broker
+    client: ModelClient
+    if mode is RunMode.OFFLINE:
+        broker, client = offline_broker(utc_now(), paper=alpaca_paper(os.environ)), offline_client()
+    else:
+        # Every key is read before the run starts, so a missing one stops it before it writes anything.
+        broker, client = _alpaca(secrets), anthropic_client(secrets.get("ANTHROPIC_API_KEY"))
+    engine = make_engine(secrets.get("DATABASE_URL"))
     try:
         result = run_daily(
-            mode=mode, config=config, engine=engine, broker=broker, client=offline_client(), force=args.force
+            mode=mode, config=config, engine=engine, broker=broker, client=client, force=args.force
         )
     finally:
         engine.dispose()
