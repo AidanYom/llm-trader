@@ -1,7 +1,8 @@
 """The weekly review (HANDOFF §11): a markdown report on recent runs, which Aidan reads in his Claude Project.
 
-It only reads: the database through repo.py, and daily bars for the baseline through a Broker. `gather()` does
-the reading and `render()` is a pure function of what it gathered.
+It only reads: the database through repo.py, and daily bars for the baseline through a Broker (AlpacaBroker
+for real runs, FakeBroker for offline ones). `gather()` does the reading and `render()` is a pure function of
+what it gathered.
 
 - The report covers one account type, the one ALPACA_PAPER names, and dry_run and submit runs; or offline runs
   alone, with --offline.
@@ -22,7 +23,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, Engine
 
-from trader.brokers.base import Broker
+from trader.brokers.base import Broker, BrokerError
 from trader.db import repo
 from trader.db.repo import ReportMalformed, ReportOrder, ReportProposal, ReportRun
 from trader.models import Bar, OrderStatus, Position, RunMode, RunStatus, VerdictStatus, finite_float
@@ -181,8 +182,11 @@ def _baseline(
         return Baseline(basket=basket, missing="n/a: no completed run with an equity snapshot")
     start, end = series[0].day, series[-1].day
     if broker is None:
-        return Baseline(basket=basket, start=start, end=end, missing="n/a: needs the Alpaca adapter (M4)")
-    bars = broker.get_daily_bars(list(basket), (today - start).days + SPARE_SESSIONS)
+        return Baseline(basket=basket, start=start, end=end, missing="n/a: no broker to read closes from")
+    try:
+        bars = broker.get_daily_bars(list(basket), (today - start).days + SPARE_SESSIONS)
+    except BrokerError as exc:  # the report still renders, and says why the baseline is missing
+        return Baseline(basket=basket, start=start, end=end, missing=f"n/a: {exc}")
     value = baseline_return(bars, basket, start, end)
     missing = None if value is not None else "n/a: the broker lacks closes for part of the basket"
     return Baseline(basket=basket, start=start, end=end, value=value, missing=missing)

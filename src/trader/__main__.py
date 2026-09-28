@@ -114,10 +114,15 @@ def _report(args: argparse.Namespace) -> int:
     config = load_config(Path.cwd())
     paper = alpaca_paper(os.environ)
     now = utc_now()
-    # Offline runs' baseline comes from the same fake bars they traded on. The Alpaca adapter, for real runs,
-    # arrives in M4; until then their baseline shows as n/a.
-    broker = offline_broker(now, paper=paper) if args.offline else None
-    engine = make_engine(Secrets(os.environ).get("DATABASE_URL"))
+    secrets = Secrets(os.environ)
+    # The baseline's closes: offline runs' come from the same fake bars they traded on, and real runs' from
+    # Alpaca, which needs the keys. --no-baseline needs neither.
+    broker: Broker | None = None
+    if args.offline:
+        broker = offline_broker(now, paper=paper)
+    elif not args.no_baseline:
+        broker = _alpaca(secrets)
+    engine = make_engine(secrets.get("DATABASE_URL"))
     try:
         path = write_report(
             engine,
