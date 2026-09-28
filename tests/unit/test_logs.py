@@ -62,6 +62,20 @@ def test_configure_logging_writes_json_to_stdout(capsys: pytest.CaptureFixture[s
     assert (entry["message"], entry["level"], entry["mode"]) == ("hello world", "DEBUG", "offline")
 
 
+@pytest.mark.parametrize(("level", "sdk_level"), [("DEBUG", logging.INFO), ("WARNING", logging.WARNING)])
+def test_the_sdks_never_log_below_info(
+    level: str, sdk_level: int, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # At DEBUG the Anthropic SDK would log whole request bodies and response headers.
+    configure_logging(level)
+
+    for name in ("anthropic", "anthropic._base_client", "httpx2", "httpcore2.http11", "urllib3", "alpaca"):
+        assert logging.getLogger(name).getEffectiveLevel() == sdk_level
+    logging.getLogger("anthropic._base_client").debug("Request options: %s", {"headers": "..."})
+    assert capsys.readouterr().out == ""
+    assert logging.getLogger("trader.run").getEffectiveLevel() == getattr(logging, level)
+
+
 def test_configure_logging_refuses_an_unknown_level() -> None:
     with pytest.raises(
         ValueError, match="LOG_LEVEL must be a logging level such as INFO or DEBUG, got 'loud'"
