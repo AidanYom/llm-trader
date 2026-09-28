@@ -16,7 +16,8 @@ from typing import Protocol
 
 from trader.briefing import avg_dollar_volume, news_line
 from trader.brokers.base import AccountSettings
-from trader.models import NEW_YORK, AccountState, Bar, NewsItem, finite_float, new_york_date
+from trader.models import NEW_YORK, AccountState, Bar, NewsItem, Policy, finite_float, new_york_date
+from trader.risk import blocked_pattern
 
 SYMBOLS = ("SPY", "XLK")
 SESSIONS = 70  # what the briefing asks for (HANDOFF §6)
@@ -26,6 +27,8 @@ SYMBOL_NEWS = 5
 LOOK_AROUND_DAYS = 10  # how far the calendar check looks back and ahead for sessions
 NEXT_SESSIONS = 3
 MAX_LINE = 150  # characters of a news line shown
+# Cash-like bond funds whose names say "Short" or "Ultra": blocked_name_patterns must not match them.
+LOOK_ALIKES = ("SHV", "BSV", "JPST", "ICSH", "GSY", "PULS")
 
 
 class SmokeBroker(Protocol):
@@ -43,6 +46,8 @@ class SmokeBroker(Protocol):
     def get_daily_bars(self, symbols: Sequence[str], sessions: int) -> dict[str, list[Bar]]: ...
 
     def get_news(self, symbols: Sequence[str] | None, since: datetime, limit: int) -> list[NewsItem]: ...
+
+    def get_asset_names(self, symbols: Sequence[str]) -> dict[str, str]: ...
 
 
 class Outcome(StrEnum):
@@ -82,7 +87,7 @@ class SmokeReport:
         return "\n".join(lines)
 
 
-def run_smoke(broker: SmokeBroker, *, now: datetime, feed: str) -> SmokeReport:
+def run_smoke(broker: SmokeBroker, *, now: datetime, feed: str, policy: Policy) -> SmokeReport:
     """Every check, in order. A check that raises becomes a failure, and the rest still run."""
     today = new_york_date(now)
     last_session: list[date] = []  # the calendar check finds it; the bars check compares against it
@@ -100,6 +105,7 @@ def run_smoke(broker: SmokeBroker, *, now: datetime, feed: str) -> SmokeReport:
             "SPY news",
             lambda: _news(broker, ["SPY"], now=now, window=timedelta(days=3), limit=SYMBOL_NEWS),
         ),
+        *_checked("asset names", lambda: _names(broker, policy)),
     ]
     when = now.astimezone(NEW_YORK).strftime("%Y-%m-%d %H:%M")
     account = "paper" if broker.is_paper else "LIVE"
@@ -255,6 +261,49 @@ def _news(
             title=f"{about}, last {hours} hours: {_count(len(stories), 'story', 'stories')} shown "
             "(untrusted third-party text)",
             lines=tuple(_cut(news_line(story)) for story in stories),
+        )
+    ]
+
+
+def _names(broker: SmokeBroker, policy: Policy) -> list[Check]:
+    """blocked_name_patterns against Alpaca's real names (HANDOFF §8).
+
+    Every blocked_symbols ticker is a leveraged or inverse fund, so its name should match a pattern. The
+    cash-like bond funds say "Short" or "Ultra" and must not match, and a made-up ticker has no name.
+    """
+    blocked = sorted(policy.blocked_symbols)
+    names = broker.get_asset_names([*blocked, *LOOK_ALIKES, UNKNOWN_SYMBOL])
+    patterns = policy.blocked_name_patterns
+    lines, problems = [], 0
+    for symbol in blocked:
+        name = names.get(symbol)
+        pattern = None if name is None else blocked_pattern(name, patterns)
+        if name is None:
+            lines.append(f"{symbol}: no name at Alpaca, so only blocked_symbols stops it")
+        elif pattern is None:
+            problems += 1
+            lines.append(
+                f'{symbol} "{name}": matches no pattern (fine only if it isn\'t leveraged or inverse)'
+            )
+        else:
+            lines.append(f'{symbol} "{name}": matches "{pattern}"')
+    for symbol in LOOK_ALIKES:
+        name = names.get(symbol)
+        pattern = None if name is None else blocked_pattern(name, patterns)
+        if pattern is not None:
+            problems += 1
+            lines.append(f'{symbol} "{name}": matches "{pattern}", but it\'s a cash-like bond fund')
+        else:
+            lines.append(f'{symbol} "{name}": no match, as it should be' if name else f"{symbol}: no name")
+    if UNKNOWN_SYMBOL in names:
+        problems += 1
+        lines.append(f'{UNKNOWN_SYMBOL} "{names[UNKNOWN_SYMBOL]}": a made-up ticker has a name')
+    return [
+        Check(
+            outcome=Outcome.WARN if problems else Outcome.OK,
+            title=f"asset names against blocked_name_patterns: {len(blocked)} blocked tickers, "
+            f"{len(LOOK_ALIKES)} bond funds that must not match",
+            lines=tuple(lines),
         )
     ]
 
