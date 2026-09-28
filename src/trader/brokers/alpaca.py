@@ -14,10 +14,12 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol
+from uuid import UUID
 
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import Adjustment, DataFeed
@@ -29,13 +31,30 @@ from alpaca.data.models.news import NewsSet
 from alpaca.data.requests import NewsRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import AssetClass, PositionSide
+from alpaca.trading.enums import (
+    AssetClass,
+    OrderClass,
+    OrderSide,
+    OrderStatus,
+    PositionSide,
+    QueryOrderStatus,
+    TimeInForce,
+)
 from alpaca.trading.models import AccountConfiguration, Calendar, TradeAccount
+from alpaca.trading.models import Order as AlpacaOrder
 from alpaca.trading.models import Position as AlpacaPosition
-from alpaca.trading.requests import GetCalendarRequest
+from alpaca.trading.requests import (
+    GetCalendarRequest,
+    GetOrdersRequest,
+    LimitOrderRequest,
+    MarketOrderRequest,
+    OrderRequest,
+    StopLossRequest,
+    TakeProfitRequest,
+)
 
-from trader.brokers.base import AccountSettings, BrokerError
-from trader.models import NEW_YORK, AccountState, Bar, NewsItem, Position, new_york_date
+from trader.brokers.base import AccountSettings, BrokerError, CancelledOrder, SubmittedOrder
+from trader.models import NEW_YORK, AccountState, Bar, NewsItem, Order, Position, Side, new_york_date
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +65,21 @@ BARS_DELAY = timedelta(minutes=20)  # the free data plan serves SIP history only
 FEEDS = {"sip": DataFeed.SIP, "delayed_sip": DataFeed.DELAYED_SIP}  # settings.alpaca_data_feed()'s values
 MAX_ERROR_TEXT = 300  # characters of an API error's body kept in BrokerError's message
 REQUEST_TIMEOUT = (10.0, 30.0)  # seconds to connect, and to wait for a response, on every Alpaca request
+ORDERS_LIMIT = 500  # the most orders one listing returns
+CANCEL_POLL_S = 0.5  # HANDOFF §8: how often to check whether a cancel has landed
+CANCEL_WAIT_S = 8.0  # and for how long
+CLOCK_SKEW = timedelta(seconds=30)  # allowed between this machine's clock and Alpaca's
+# A cancel has landed once the order is in one of these (HANDOFF §8).
+FINISHED = frozenset(
+    {
+        OrderStatus.CANCELED,
+        OrderStatus.FILLED,
+        OrderStatus.EXPIRED,
+        OrderStatus.REJECTED,
+        OrderStatus.REPLACED,
+        OrderStatus.DONE_FOR_DAY,
+    }
+)
 
 
 class TradingApi(Protocol):
@@ -58,6 +92,16 @@ class TradingApi(Protocol):
     def get_all_positions(self) -> list[AlpacaPosition] | RawData: ...
 
     def get_calendar(self, filters: GetCalendarRequest | None = None, /) -> list[Calendar] | RawData: ...
+
+    def get_orders(self, filter: GetOrdersRequest | None = None, /) -> list[AlpacaOrder] | RawData: ...
+
+    def get_order_by_id(self, order_id: UUID | str, /) -> AlpacaOrder | RawData: ...
+
+    def get_order_by_client_id(self, client_id: str, /) -> AlpacaOrder | RawData: ...
+
+    def cancel_order_by_id(self, order_id: UUID | str, /) -> None: ...
+
+    def submit_order(self, order_data: OrderRequest, /) -> AlpacaOrder | RawData: ...
 
 
 class BarsApi(Protocol):
@@ -95,7 +139,10 @@ def _utc_now() -> datetime:
 
 
 class AlpacaBroker:
-    """The Broker for an Alpaca account: paper unless ALPACA_PAPER is false."""
+    """The Broker for an Alpaca account: paper unless ALPACA_PAPER is false.
+
+    Only run.py calls its order methods (CLAUDE.md invariant 2).
+    """
 
     def __init__(
         self,
@@ -106,6 +153,8 @@ class AlpacaBroker:
         paper: bool,
         feed: str = "sip",
         clock: Callable[[], datetime] = _utc_now,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if feed not in FEEDS:
             raise ValueError(f"unsupported data feed {feed!r}")
@@ -114,7 +163,9 @@ class AlpacaBroker:
         self._news = news
         self._paper = paper
         self._feed = FEEDS[feed]
-        self._clock = clock  # "now" for the bars' end, and "today" for dropping an unfinished session
+        self._clock = clock  # "now" for the bars' end and a submit's start; "today" for an unfinished session
+        self._sleep = sleep  # for waiting on cancels
+        self._monotonic = monotonic
 
     @classmethod
     def connect(cls, *, api_key: str, secret_key: str, paper: bool, feed: str) -> AlpacaBroker:
@@ -161,6 +212,109 @@ class AlpacaBroker:
         if skipped:
             log.warning("skipped malformed news stories", extra={"skipped": skipped, "about": about})
         return items[:limit]
+
+    # ---- Broker: orders ------------------------------------------------------------------------------------
+
+    def cancel_open_buy_orders(self) -> list[CancelledOrder]:
+        """Cancel every open buy: earlier runs' entries, whose unfilled legs Alpaca cancels with them.
+
+        It doesn't wait for the cancels to land: the model's turns come before any new entry is sent.
+        """
+        with _broker_errors("cancel open buy orders"):
+            request = GetOrdersRequest(status=QueryOrderStatus.OPEN, side=OrderSide.BUY, limit=ORDERS_LIMIT)
+            entries = _models(self._trading.get_orders(request), AlpacaOrder)
+            for entry in entries:
+                self._cancel(entry)
+            return [
+                CancelledOrder(
+                    broker_order_id=str(entry.id), symbol=entry.symbol or "", filled_qty=_filled(entry)
+                )
+                for entry in entries
+            ]
+
+    def cancel_open_orders(self, symbol: str) -> list[str]:
+        """Cancel the symbol's open orders, such as its stop and take-profit, and wait for the cancels."""
+        with _broker_errors(f"cancel the open orders for {symbol}"):
+            request = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol], limit=ORDERS_LIMIT)
+            orders = _models(self._trading.get_orders(request), AlpacaOrder)
+            for order in orders:
+                self._cancel(order)
+            self._wait_for_cancels(orders)
+            return [str(order.id) for order in orders]
+
+    def submit(self, order: Order, client_order_id: str) -> SubmittedOrder:
+        """Send the order. If the call fails but Alpaca has the order anyway, it counts as submitted.
+
+        alpaca-py retries HTTP 429 and 504 responses itself, so a 504 can hide an order Alpaca accepted, and
+        the retry is then refused as a duplicate. An order with the same client ID from before this call
+        belongs to an earlier run, such as the one a --force rerun replaces, so the failure stands
+        (HANDOFF §8).
+        """
+        with _broker_errors(f"submit {order.side.value} {order.qty} {order.symbol}"):
+            request = order_request(order, client_order_id)
+            started = self._clock()
+            try:
+                placed = _model(self._trading.submit_order(request), AlpacaOrder)
+            except Exception:
+                found = self._placed_since(client_order_id, started)
+                if found is None:
+                    raise
+                log.warning(
+                    "the order reached Alpaca although its submit failed",
+                    extra={"client_order_id": client_order_id, "broker_order_id": str(found.id)},
+                )
+                placed = found
+            return receipt(placed)
+
+    def _cancel(self, order: AlpacaOrder) -> None:
+        """Cancel the order. Alpaca cancels the rest of a bracket or OTO group along with it, so a cancel that
+        fails because the order is already over, or being cancelled, isn't an error."""
+        try:
+            self._trading.cancel_order_by_id(order.id)
+        except APIError:
+            status = self._order(order.id).status
+            if status not in FINISHED and status is not OrderStatus.PENDING_CANCEL:
+                raise
+
+    def _wait_for_cancels(self, orders: Sequence[AlpacaOrder]) -> None:
+        """Poll until every order is finished (HANDOFF §8). Until its cancel lands, an order holds the shares.
+
+        An order that fills more shares while its cancel is pending has changed the position, so the exit that
+        follows would sell the wrong amount: that raises too.
+        """
+        pending = {order.id: order for order in orders}
+        deadline = self._monotonic() + CANCEL_WAIT_S
+        while True:
+            statuses: dict[UUID, OrderStatus] = {}
+            for order_id, listed in pending.items():
+                current = self._order(order_id)
+                more = _filled(current) - _filled(listed)
+                if more > 0:
+                    raise Unusable(
+                        f"order {order_id} filled {more:g} more shares while its cancel was pending, "
+                        "so the position changed and the exit isn't sent"
+                    )
+                statuses[order_id] = current.status
+            pending = {
+                order_id: order for order_id, order in pending.items() if statuses[order_id] not in FINISHED
+            }
+            if not pending:
+                return
+            if self._monotonic() >= deadline:
+                waiting = ", ".join(f"{order_id} ({statuses[order_id].value})" for order_id in pending)
+                raise Unusable(f"cancels still pending after {CANCEL_WAIT_S:g} s: {waiting}")
+            self._sleep(CANCEL_POLL_S)
+
+    def _placed_since(self, client_order_id: str, started: datetime) -> AlpacaOrder | None:
+        """The order with this client ID, if Alpaca created it after `started`, allowing for clock skew."""
+        with suppress(Exception):  # no such order, or the lookup failed too: the submit's own error stands
+            found = _model(self._trading.get_order_by_client_id(client_order_id), AlpacaOrder)
+            if found.created_at >= started - CLOCK_SKEW:
+                return found
+        return None
+
+    def _order(self, order_id: UUID) -> AlpacaOrder:
+        return _model(self._trading.get_order_by_id(order_id), AlpacaOrder)
 
     # ---- Not part of Broker: for trader smoke --------------------------------------------------------------
 
@@ -330,6 +484,50 @@ def _timestamp(value: object) -> datetime | None:
     except ValueError:
         return None
     return (moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)).astimezone(UTC)
+
+
+def order_request(order: Order, client_order_id: str) -> LimitOrderRequest | MarketOrderRequest:
+    """The Alpaca request for an order the risk engine built (HANDOFF §8).
+
+    A buy is a GTC limit order with a stop leg (OTO), plus a take-profit leg when it has one (bracket). GTC
+    keeps the legs at the broker after the entry fills, and nothing trades in extended hours. A sell is a full
+    exit at market, good for the day.
+    """
+    if order.side is Side.SELL:
+        return MarketOrderRequest(
+            symbol=order.symbol,
+            qty=order.qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+            client_order_id=client_order_id,
+        )
+    if order.limit_price is None or order.stop_price is None:  # Order refuses such a buy; this tells mypy
+        raise Unusable(f"a buy of {order.symbol} needs a limit price and a stop")
+    take_profit = order.take_profit_price
+    return LimitOrderRequest(
+        symbol=order.symbol,
+        qty=order.qty,
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.GTC,
+        limit_price=order.limit_price,
+        client_order_id=client_order_id,
+        order_class=OrderClass.OTO if take_profit is None else OrderClass.BRACKET,
+        stop_loss=StopLossRequest(stop_price=order.stop_price),
+        take_profit=None if take_profit is None else TakeProfitRequest(limit_price=take_profit),
+    )
+
+
+def receipt(placed: AlpacaOrder) -> SubmittedOrder:
+    """What run.py records about an order Alpaca accepted."""
+    return SubmittedOrder(
+        broker_order_id=str(placed.id), status=placed.status.value, client_order_id=placed.client_order_id
+    )
+
+
+def _filled(order: AlpacaOrder) -> float:
+    """The shares the order has filled so far, or 0 when Alpaca leaves it out."""
+    filled = _number(order.filled_qty)
+    return 0.0 if math.isnan(filled) else filled
 
 
 def _number(value: str | float | None) -> float:

@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
 
 import pytest
 from alpaca.common.exceptions import APIError
@@ -26,9 +27,11 @@ from alpaca.data.models.news import NewsSet
 from alpaca.data.requests import NewsRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrameUnit
 from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderSide, OrderStatus, QueryOrderStatus
 from alpaca.trading.models import AccountConfiguration, Calendar, TradeAccount
+from alpaca.trading.models import Order as AlpacaOrder
 from alpaca.trading.models import Position as AlpacaPosition
-from alpaca.trading.requests import GetCalendarRequest
+from alpaca.trading.requests import GetCalendarRequest, GetOrdersRequest, OrderRequest
 from pydantic import ValidationError
 
 from trader.brokers.alpaca import (
@@ -38,14 +41,18 @@ from trader.brokers.alpaca import (
     NewsApi,
     TradingApi,
     account_state,
+    order_request,
     real_clients,
 )
-from trader.brokers.base import AccountSettings, BrokerError
-from trader.models import NEW_YORK, Bar, NewsItem, Position
+from trader.brokers.base import AccountSettings, Broker, BrokerError, CancelledOrder, SubmittedOrder
+from trader.models import NEW_YORK, Bar, NewsItem, Order, Position, Side
 
 NOW = datetime(2026, 9, 28, 12, 31, tzinfo=UTC)  # Monday, 08:31 in New York
 TODAY = date(2026, 9, 28)
 SINCE = NOW - timedelta(hours=24)
+BUY = Order(symbol="XLE", side=Side.BUY, qty=10, limit_price=90.9, stop_price=82.8)
+CLIENT_ID = "llmt-2026-09-28-XLE-buy"
+FINISHED = {"canceled", "filled", "expired", "rejected", "replaced", "done_for_day"}
 
 
 # ---- alpaca-py objects, built from JSON shaped like the API's ----------------------------------------------
@@ -133,6 +140,35 @@ def story(created_at: str, headline: str, **fields: Any) -> dict[str, Any]:
     return data | fields
 
 
+def uid(number: int) -> str:
+    return f"00000000-0000-4000-8000-{number:012d}"
+
+
+def alpaca_order(number: int, symbol: str, side: str, **fields: Any) -> AlpacaOrder:
+    """An order as the API sends it, with uid(number) as its ID.
+
+    By default it's an open limit order from Friday.
+    """
+    data: dict[str, Any] = {
+        "id": uid(number),
+        "client_order_id": f"client-{number}",
+        "created_at": "2026-09-25T12:31:00Z",
+        "updated_at": "2026-09-25T12:31:00Z",
+        "submitted_at": "2026-09-25T12:31:00Z",
+        "symbol": symbol,
+        "asset_class": "us_equity",
+        "qty": "10",
+        "filled_qty": "0",
+        "order_class": "simple",
+        "type": "limit",
+        "side": side,
+        "time_in_force": "gtc",
+        "status": "new",
+        "extended_hours": False,
+    }
+    return AlpacaOrder(**(data | fields))
+
+
 def api_error(status: int, message: str) -> APIError:
     body = json.dumps({"code": 40010001, "message": message})
     # alpaca-py's APIError has no type annotations. It reads the status from the HTTP error's response.
@@ -160,13 +196,24 @@ class FakeTrading:
         positions: Sequence[AlpacaPosition] = (),
         sessions: Sequence[Calendar] = (),
         config: AccountConfiguration | None = None,
+        orders: Sequence[AlpacaOrder] = (),
+        groups: Sequence[Sequence[int]] = (),
     ) -> None:
         self.account = trade_account() if account is None else account
         self.positions = list(positions)
         self.sessions = list(sessions)
         self.config = configuration() if config is None else config
+        self.orders = {str(order.id): order for order in orders}  # Alpaca's state, by order ID
+        self.groups = [{uid(number) for number in group} for group in groups]  # cancelled together
+        self.pending_checks: dict[str, int] = {}  # status checks an order's cancel stays pending for
+        self.fills_when_cancelled: dict[str, str] = {}  # filled_qty an order reports once its cancel is asked
+        self.cancel_failures: dict[str, Exception] = {}
+        self.submit_failure: Exception | None = None
+        self.placed_before_failing = False  # the submit fails, but Alpaca has the order
         self.failure: Exception | None = None  # every call raises it, when set
         self.requests: list[object] = []
+        self.cancelled: list[str] = []
+        self.submitted: list[OrderRequest] = []
 
     def _call(self, request: object = None) -> None:
         if request is not None:
@@ -189,6 +236,73 @@ class FakeTrading:
     def get_calendar(self, filters: GetCalendarRequest | None = None, /) -> list[Calendar] | dict[str, Any]:
         self._call(filters)
         return self.sessions
+
+    # Each call returns copies, as the API does: the adapter compares an order's states over time.
+
+    def get_orders(self, filter: GetOrdersRequest | None = None, /) -> list[AlpacaOrder] | dict[str, Any]:
+        self._call(filter)
+        assert filter is not None and filter.status == QueryOrderStatus.OPEN
+        return [
+            order.model_copy()
+            for order in self.orders.values()
+            if order.status.value not in FINISHED
+            and (filter.side is None or order.side == filter.side)
+            and (filter.symbols is None or order.symbol in filter.symbols)
+        ]
+
+    def get_order_by_id(self, order_id: UUID | str, /) -> AlpacaOrder | dict[str, Any]:
+        self._call()
+        key = str(order_id)
+        order = self.orders[key]
+        if order.status == OrderStatus.PENDING_CANCEL:
+            checks = self.pending_checks.get(key, 0)
+            if checks > 0:
+                self.pending_checks[key] = checks - 1
+            else:
+                order.status = OrderStatus.CANCELED
+        return order.model_copy()
+
+    def get_order_by_client_id(self, client_id: str, /) -> AlpacaOrder | dict[str, Any]:
+        self._call()
+        for order in self.orders.values():
+            if order.client_order_id == client_id:
+                return order.model_copy()
+        raise api_error(404, "order not found")
+
+    def cancel_order_by_id(self, order_id: UUID | str, /) -> None:
+        self._call()
+        key = str(order_id)
+        self.cancelled.append(key)
+        if key in self.cancel_failures:
+            raise self.cancel_failures[key]
+        order = self.orders[key]
+        if order.status.value in FINISHED or order.status == OrderStatus.PENDING_CANCEL:
+            raise api_error(422, "order is not cancelable")
+        for member in next((group for group in self.groups if key in group), {key}):
+            if self.orders[member].status.value not in FINISHED:
+                self.orders[member].status = OrderStatus.PENDING_CANCEL
+        if key in self.fills_when_cancelled:
+            order.filled_qty = self.fills_when_cancelled[key]
+
+    def submit_order(self, order_data: OrderRequest, /) -> AlpacaOrder | dict[str, Any]:
+        self._call()
+        self.submitted.append(order_data)
+        if self.submit_failure is not None and not self.placed_before_failing:
+            raise self.submit_failure
+        placed = alpaca_order(
+            100 + len(self.submitted),
+            order_data.symbol or "",
+            "buy" if order_data.side is None else order_data.side.value,
+            client_order_id=order_data.client_order_id,
+            created_at="2026-09-28T12:31:00Z",
+            updated_at="2026-09-28T12:31:00Z",
+            submitted_at="2026-09-28T12:31:00Z",
+            status="accepted",
+        )
+        self.orders[str(placed.id)] = placed
+        if self.submit_failure is not None:
+            raise self.submit_failure
+        return placed.model_copy()
 
 
 class FakeBars:
@@ -222,13 +336,30 @@ class FakeNews:
         return {"news": list(self.stories)}
 
 
+class Ticker:
+    """A monotonic clock that only moves when the adapter sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 def broker(
     trading: FakeTrading | None = None,
     bars: FakeBars | None = None,
     news: FakeNews | None = None,
     *,
     feed: str = "sip",
+    ticker: Ticker | None = None,
 ) -> AlpacaBroker:
+    ticker = Ticker() if ticker is None else ticker
     return AlpacaBroker(
         trading=FakeTrading() if trading is None else trading,
         bars=FakeBars() if bars is None else bars,
@@ -236,6 +367,8 @@ def broker(
         paper=True,
         feed=feed,
         clock=lambda: NOW,
+        sleep=ticker.sleep,
+        monotonic=ticker.monotonic,
     )
 
 
@@ -249,6 +382,12 @@ def test_the_real_alpaca_clients_fit_the_adapter() -> None:
     news: NewsApi = NewsClient("key-not-real", "secret-not-real", raw_data=True)
 
     assert AlpacaBroker(trading=trading, bars=bars, news=news, paper=True).is_paper
+
+
+def test_the_adapter_is_a_broker() -> None:
+    adapter: Broker = broker()  # mypy checks AlpacaBroker against the Broker protocol
+
+    assert adapter.is_paper
 
 
 @pytest.mark.parametrize("paper", [True, False])
@@ -313,8 +452,10 @@ def test_values_alpaca_leaves_out_are_unknown() -> None:
     assert math.isnan(held.unrealized_plpc)
 
 
-def test_a_short_position_is_refused() -> None:
-    short = position("XLE", side="short", qty="-4")
+@pytest.mark.parametrize(("side", "qty"), [("short", "-4"), ("short", "4"), ("long", "-4")])
+def test_a_short_position_is_refused(side: str, qty: str) -> None:
+    # Alpaca reports a short with side "short" and a negative quantity; either one alone is refused too.
+    short = position("XLE", side=side, qty=qty)
 
     with pytest.raises(BrokerError, match="^read the account: the account holds a short position in XLE; "):
         broker(FakeTrading(positions=[short])).get_account()
@@ -493,6 +634,181 @@ def test_news_about_no_symbols_needs_no_request() -> None:
     assert news.requests == []
 
 
+# ---- Stale entries and exits ------------------------------------------------------------------------------
+
+
+def test_stale_entries_are_the_open_buys_each_cancelled_by_id() -> None:
+    trading = FakeTrading(
+        orders=[
+            alpaca_order(1, "IGV", "buy"),
+            alpaca_order(2, "URA", "buy", status="partially_filled", filled_qty="3"),
+            alpaca_order(3, "SMH", "sell", type="stop"),  # a held position's stop leg
+        ]
+    )
+
+    cancelled = broker(trading).cancel_open_buy_orders()
+
+    assert cancelled == [
+        CancelledOrder(broker_order_id=uid(1), symbol="IGV", filled_qty=0.0),
+        CancelledOrder(broker_order_id=uid(2), symbol="URA", filled_qty=3.0),
+    ]
+    assert trading.requests == [GetOrdersRequest(status=QueryOrderStatus.OPEN, side=OrderSide.BUY, limit=500)]
+    assert trading.cancelled == [uid(1), uid(2)]
+    assert trading.orders[uid(3)].status == OrderStatus.NEW
+
+
+def test_an_exit_waits_until_its_legs_cancels_have_landed() -> None:
+    trading = FakeTrading(
+        orders=[alpaca_order(3, "SMH", "sell", type="stop"), alpaca_order(4, "SMH", "sell")],
+        groups=[(3, 4)],  # a bracket's stop and take-profit: Alpaca cancels both when one is cancelled
+    )
+    trading.pending_checks[uid(3)] = 2  # the stop's cancel lands on the third status check
+    trading.pending_checks[uid(4)] = 1  # the take-profit is still being cancelled when first re-read
+    ticker = Ticker()
+
+    assert broker(trading, ticker=ticker).cancel_open_orders("SMH") == [uid(3), uid(4)]
+
+    # The take-profit was already being cancelled with the stop, so its own cancel was refused, harmlessly.
+    assert trading.cancelled == [uid(3), uid(4)]
+    assert trading.requests == [GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=["SMH"], limit=500)]
+    assert ticker.sleeps == [0.5, 0.5]
+
+
+def test_an_exit_whose_cancels_havent_landed_after_eight_seconds_is_an_error() -> None:
+    trading = FakeTrading(orders=[alpaca_order(3, "SMH", "sell", type="stop")])
+    trading.pending_checks[uid(3)] = 1_000
+    ticker = Ticker()
+
+    with pytest.raises(BrokerError) as exc_info:
+        broker(trading, ticker=ticker).cancel_open_orders("SMH")
+
+    assert str(exc_info.value) == (
+        f"cancel the open orders for SMH: cancels still pending after 8 s: {uid(3)} (pending_cancel)"
+    )
+    assert ticker.sleeps == [0.5] * 16
+
+
+def test_an_order_that_fills_while_its_cancel_is_pending_stops_the_exit() -> None:
+    trading = FakeTrading(orders=[alpaca_order(3, "SMH", "sell", type="stop")])
+    trading.fills_when_cancelled[uid(3)] = "5"
+
+    with pytest.raises(
+        BrokerError, match="filled 5 more shares while its cancel was pending, so the position"
+    ):
+        broker(trading).cancel_open_orders("SMH")
+
+
+def test_a_refused_cancel_of_an_order_still_open_is_an_error() -> None:
+    trading = FakeTrading(orders=[alpaca_order(3, "SMH", "sell", type="stop")])
+    trading.cancel_failures[uid(3)] = api_error(422, "order is not cancelable")
+
+    with pytest.raises(BrokerError, match="^cancel the open orders for SMH: HTTP 422: "):
+        broker(trading).cancel_open_orders("SMH")
+
+
+def test_a_symbol_without_open_orders_has_nothing_to_wait_for() -> None:
+    ticker = Ticker()
+
+    assert broker(FakeTrading(), ticker=ticker).cancel_open_orders("XLE") == []
+    assert ticker.sleeps == []
+
+
+# ---- Orders ------------------------------------------------------------------------------------------------
+
+
+def test_a_buy_is_a_gtc_limit_order_with_its_stop_leg() -> None:
+    fields = order_request(BUY, CLIENT_ID).to_request_fields()
+
+    # The JSON body alpaca-py sends: its request classes serialize their enums as these strings.
+    assert json.loads(json.dumps(fields)) == {
+        "symbol": "XLE",
+        "qty": 10,
+        "side": "buy",
+        "type": "limit",
+        "time_in_force": "gtc",
+        "order_class": "oto",
+        "client_order_id": CLIENT_ID,
+        "stop_loss": {"stop_price": 82.8},
+        "limit_price": 90.9,
+    }
+
+
+def test_a_buy_with_a_take_profit_is_a_bracket() -> None:
+    order = Order(
+        symbol="XLE", side=Side.BUY, qty=10, limit_price=90.9, stop_price=82.8, take_profit_price=103.5
+    )
+
+    fields = json.loads(json.dumps(order_request(order, CLIENT_ID).to_request_fields()))
+
+    assert fields["order_class"] == "bracket"
+    assert (fields["stop_loss"], fields["take_profit"]) == ({"stop_price": 82.8}, {"limit_price": 103.5})
+
+
+def test_a_sell_is_a_full_exit_at_market_for_the_day() -> None:
+    order = Order(symbol="SMH", side=Side.SELL, qty=5)
+
+    assert json.loads(json.dumps(order_request(order, "llmt-2026-09-28-SMH-sell").to_request_fields())) == {
+        "symbol": "SMH",
+        "qty": 5,
+        "side": "sell",
+        "type": "market",
+        "time_in_force": "day",
+        "client_order_id": "llmt-2026-09-28-SMH-sell",
+    }
+
+
+def test_submit_returns_alpacas_receipt() -> None:
+    trading = FakeTrading()
+
+    receipt = broker(trading).submit(BUY, CLIENT_ID)
+
+    assert receipt == SubmittedOrder(broker_order_id=uid(101), status="accepted", client_order_id=CLIENT_ID)
+    (request,) = trading.submitted
+    assert request.to_request_fields()["order_class"] == "oto"
+
+
+def test_a_submit_that_failed_after_alpaca_took_the_order_counts_as_submitted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    trading = FakeTrading()
+    # A 504 hid the accepted order, and alpaca-py's retry was refused as a duplicate.
+    trading.submit_failure = api_error(422, "client_order_id must be unique")
+    trading.placed_before_failing = True
+
+    with caplog.at_level(logging.WARNING, logger="trader.brokers.alpaca"):
+        receipt = broker(trading).submit(BUY, CLIENT_ID)
+
+    assert receipt == SubmittedOrder(broker_order_id=uid(101), status="accepted", client_order_id=CLIENT_ID)
+    assert [record.getMessage() for record in caplog.records] == [
+        "the order reached Alpaca although its submit failed"
+    ]
+
+
+def test_an_order_created_within_the_clock_skew_counts_as_this_submits() -> None:
+    just_before = alpaca_order(8, "XLE", "buy", client_order_id=CLIENT_ID, created_at="2026-09-28T12:30:40Z")
+    trading = FakeTrading(orders=[just_before])  # created 20 s before the submit started, by Alpaca's clock
+    trading.submit_failure = ConnectionError("read timed out")
+
+    assert broker(trading).submit(BUY, CLIENT_ID).broker_order_id == uid(8)
+
+
+def test_a_duplicate_of_an_earlier_runs_order_stays_an_error() -> None:
+    earlier = alpaca_order(7, "XLE", "buy", client_order_id=CLIENT_ID, created_at="2026-09-28T12:00:00Z")
+    trading = FakeTrading(orders=[earlier])  # from a run 31 minutes ago, such as one --force replaces
+    trading.submit_failure = api_error(422, "client_order_id must be unique")
+
+    with pytest.raises(BrokerError, match="^submit buy 10 XLE: HTTP 422: .*client_order_id must be unique"):
+        broker(trading).submit(BUY, CLIENT_ID)
+
+
+def test_a_failed_submit_with_no_order_at_alpaca_keeps_its_own_error() -> None:
+    trading = FakeTrading()
+    trading.submit_failure = api_error(403, "insufficient buying power")
+
+    with pytest.raises(BrokerError, match="^submit buy 10 XLE: HTTP 403: .*insufficient buying power"):
+        broker(trading).submit(BUY, CLIENT_ID)
+
+
 # ---- Errors ------------------------------------------------------------------------------------------------
 
 
@@ -515,6 +831,9 @@ def test_every_alpaca_failure_becomes_a_broker_error(failure: Exception, message
         (lambda: adapter.get_daily_bars(["SPY"], 70), "read daily bars for SPY"),
         (lambda: adapter.get_news(["SPY"], SINCE, 10), "read news about SPY"),
         (adapter.account_settings, "read the account settings"),
+        (adapter.cancel_open_buy_orders, "cancel open buy orders"),
+        (lambda: adapter.cancel_open_orders("SMH"), "cancel the open orders for SMH"),
+        (lambda: adapter.submit(BUY, CLIENT_ID), "submit buy 10 XLE"),
     ]:
         with pytest.raises(BrokerError) as exc_info:
             call()
