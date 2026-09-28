@@ -40,7 +40,7 @@ EventBridge Scheduler 08:31 ET Mon–Fri → Lambda (container image) → trader
  4. Daily bars for SPY + sector ETFs + industry ETFs (70 sessions); news (24h, market + held symbols)
  5. Build briefing (markdown)
  6. Claude tool loop: get_price_history / get_news (≤12 calls) → submit_proposals
- 7. Fetch 25 sessions of bars for any proposed buy symbol not already seen
+ 7. Fetch 25 sessions of bars for any proposed buy symbol not already seen, and each proposed buy's asset name
  8. Risk engine → verdicts (approved / trimmed / rejected)
  9. submit mode + trading_enabled: exits (cancel legs → market sell), entries (limit + stop legs)
 10. Persist everything; mark run completed; log a one-screen summary
@@ -70,7 +70,7 @@ The target changed after M3: the first limits (6 positions of up to 8%) capped i
 
 - **SDK:** `anthropic` Python SDK, Messages API. The model is `claude-sonnet-5`, set in `config/strategy.yaml`.
 - **Request settings:** `max_tokens` 4000 per turn. Client timeout 120 s with SDK `max_retries=2`, set by `agent.anthropic_client()`. A 4,000-token turn can take over a minute, and the SDK retries a timed-out request, so a shorter timeout could fail a run on one long turn.
-- **Thinking is off.** Claude Sonnet 5 runs adaptive thinking when a request leaves out `thinking`, and thinking tokens count against `max_tokens`, so every request sends `thinking: {"type": "disabled"}`. Anthropic's guidance for Sonnet 5 prefers adaptive thinking at low effort, because the model reaches for tools less readily with thinking off. Runs don't record a thinking setting, so thinking stays off for the M4 dry runs. An experiment needs that setting recorded with each run, a larger `max_tokens` and a longer timeout.
+- **Thinking is off.** Claude Sonnet 5 runs adaptive thinking when a request leaves out `thinking`, and thinking tokens count against `max_tokens`, so every request sends `thinking: {"type": "disabled"}`. Anthropic's guidance for Sonnet 5 prefers adaptive thinking at low effort, because the model reaches for tools less readily with thinking off. Runs don't record a thinking setting, so thinking stays off until an experiment adds one, recorded with each run, along with a larger `max_tokens` and a longer timeout.
 - **Prompt caching:**
   - The system prompt is sent as a single text block with `cache_control: {"type": "ephemeral"}`.
   - The first user message is one text block containing the briefing, also marked `cache_control: {"type": "ephemeral"}`, because the tool loop re-sends it every turn.
@@ -140,7 +140,7 @@ The data behind it:
 
 ## 7. Risk engine
 
-`trader/risk.py` is pure and deterministic, with no I/O. Its signature is `evaluate(proposals, account, stats, ctx, policy) -> list[Verdict]`.
+`trader/risk.py` is pure and deterministic, with no I/O. Its signature is `evaluate(proposals, account, stats, ctx, policy, asset_names) -> list[Verdict]`, where `asset_names` holds the broker's name for each proposed buy's symbol.
 
 - Verdicts come back in the same order as the proposals.
 - The engine never raises on bad input:
@@ -158,8 +158,11 @@ The data behind it:
 **Buy:** checks are applied in this order, and the first failure rejects with its reason:
 
 1. **Drawdown freeze:** if `equity < max(equity_peak, equity) × (1 − drawdown_freeze_pct/100)`, reject. Sells stay allowed during a freeze.
-2. **Blocklist:** the symbol is in `blocked_symbols`.
-3. **Market data:** no stats for the symbol, or stats without a usable last close and average dollar volume.
+2. **Blocklist:** the symbol is in `blocked_symbols`, or its asset name matches one of `blocked_name_patterns`. `blocked_symbols` can't list every leveraged or inverse fund, so their names are checked too.
+   - A pattern matches when it appears in the name as whole words, ignoring case: the characters just before and after it aren't letters or digits, and runs of whitespace count as one space. So `3X` matches "Bull 3X Shares" and "-3X", and `Bear` doesn't match "Bearish".
+   - Bare `Short` and `Ultra` would match cash-like bond funds such as "iShares Short Treasury Bond ETF" and "Invesco Ultra Short Duration ETF". ProShares' leveraged and inverse funds all start with "ProShares Ultra" or "ProShares Short", so the list names those phrases instead.
+3. **Market data:** no stats for the symbol, stats without a usable last close and average dollar volume, or no asset name, which leaves step 2's name check unable to run.
+   - A symbol whose last bar is older than the latest session in the briefing's ETF bars, such as a halted or delisted stock, gets no stats. So a buy of it is rejected here instead of being sized on an old close.
 4. **Price:** `last_close < min_price`.
 5. **Liquidity:** `avg_dollar_volume_20d < min_avg_dollar_volume`, where the average is the mean of close × volume over the last 20 sessions.
 6. **Stop:** `stop_pct` is missing or outside `[stop.min_pct, stop.max_pct]`. Every buy needs a stop (CLAUDE.md invariant 3), and the policy loader refuses `stop.required: false`.
@@ -192,6 +195,7 @@ The data behind it:
   - `is_trading_day(day)`
   - `get_account() -> AccountState` (equity, cash, positions)
   - `get_daily_bars(symbols, sessions) -> {symbol: [Bar]}`: the last `sessions` completed sessions, oldest first
+  - `get_asset_names(symbols) -> {symbol: name}`: the broker's name for each asset. A symbol the broker doesn't know, or lists without a name, is left out.
   - `get_news(symbols|None, since, limit) -> [NewsItem]`
   - `cancel_open_buy_orders() -> [CancelledOrder(broker_order_id, symbol, filled_qty)]`
   - `cancel_open_orders(symbol) -> [ids]`: returns once every cancel has landed
@@ -230,6 +234,7 @@ The data behind it:
   - 70 sessions of bars for SPY and XLK, checked against the last completed session
   - a bars request that includes an unknown ticker, which must be left out rather than fail the request
   - market news from the last 24 hours, and SPY's news
+  - the asset names of every `blocked_symbols` ticker and of a few cash-like bond funds that say "Short" or "Ultra", with the pattern each one matches. This checks `blocked_name_patterns` against Alpaca's real names, warning when a blocked ticker isn't matched or a bond fund is.
 
   It exits 1 if any read fails. Warnings don't change the exit code.
 
@@ -543,7 +548,7 @@ Everything runs in Docker; nothing uses the host's Python.
   - Its call sequences (cancel then wait, submit then look up, error translation) run against a fake of the alpaca-py clients' public methods. The fake is typed by protocols that mypy checks the real clients satisfy.
   - Nothing patches alpaca-py or `requests`. `make smoke` and dry runs cover the live API.
 - **Unit tests** (no database):
-  - **Risk engine:** normal buy with exact bracket prices; missing or out-of-range stop; trim to max position; an existing holding counts toward the cap; trim to cash after the buffer; price and liquidity floors; the average-dollar-volume trim; under one share; blocklist and unknown symbol; the drawdown freeze blocks buys but not sells; a sell is a full exit; no shorting; max open positions, with exits freeing slots; the weekly cap across multiple buys in one run; cash shared across buys in one run; duplicates; `target_pct` of 0; a take-profit too close to the entry is dropped.
+  - **Risk engine:** normal buy with exact bracket prices; missing or out-of-range stop; trim to max position; an existing holding counts toward the cap; trim to cash after the buffer; price and liquidity floors; the average-dollar-volume trim; under one share; blocklist and unknown symbol; a leveraged or inverse fund's name, and a cash-like fund's name that must not match; no asset name; the drawdown freeze blocks buys but not sells; a sell is a full exit; no shorting; max open positions, with exits freeing slots; the weekly cap across multiple buys in one run; cash shared across buys in one run; duplicates; `target_pct` of 0; a take-profit too close to the entry is dropped.
   - **Agent:** research then submit (tool results feed stats; cache_control is present); the only tools are the three read-only ones; a nudge that recovers; a nudge that gives up; the research budget is enforced; malformed proposals; news tool output is labeled untrusted; invalid symbols are rejected.
   - **Briefing:** the return math, the sort order, and the freeze banner.
 - **Integration tests** (Postgres `trader_test`):
@@ -635,7 +640,7 @@ Build in this order, one branch and pull request per milestone. Post a short pla
   - `make offline` completes a run that writes every table
   - `make report ARGS=--offline` renders from it (reports leave out offline runs unless asked, section 11)
   - the full test list passes
-- **M4: Real services, local.** `brokers/alpaca.py`, the Anthropic client wiring, and `smoke.py`. M4 also rejects buys of leveraged and inverse ETFs by their Alpaca asset name, because `blocked_symbols` can't list every such product; the name patterns become a new policy setting that Aidan approves. Aidan adds keys and runs `make smoke`, then several `make dry-run` runs. Fix any adapter mismatches the smoke command finds. **Done when:** smoke passes and dry runs produce sensible briefings and verdicts.
+- **M4: Real services, local.** `brokers/alpaca.py`, the Anthropic client wiring, and `smoke.py`. M4 also rejects buys of leveraged and inverse ETFs by their Alpaca asset name, because `blocked_symbols` can't list every such product; the name patterns become a new policy setting that Aidan approves. Aidan adds keys and runs `make smoke`. Fix any adapter mismatches the smoke command finds. **Done when:** smoke passes, including its check of the name patterns against Alpaca's names. Aidan dropped the planned dry runs: the first real runs are paper `submit` runs in Lambda (M5).
 - **M5: Production.** The Lambda image target, `infra/` Terraform, the Neon project, SSM parameters, `make deploy` and `migrate-prod`, and the error alarm. **Done when:**
   - the scheduled Lambda completes a dry run against Neon
   - a forced error sends the alarm email
@@ -801,6 +806,11 @@ drawdown_freeze_pct: 15        # equity this far below peak → buys rejected (s
 drawdown_peak_since: null      # ISO date; ignore earlier equity history (set at go-live or after a paper reset)
 
 blocked_symbols: [TQQQ, SQQQ, SOXL, SOXS, UVXY, SVXY, SPXL, SPXS, TSLL, NVDL, LABU, LABD, TNA, TZA, UPRO, SPXU]
+
+# Leveraged and inverse funds: a buy is rejected when its Alpaca asset name contains one of these as whole
+# words, ignoring case (section 7). Bare "Short" and "Ultra" would also match cash-like bond funds.
+blocked_name_patterns: [1X, 1.25X, 1.5X, 1.75X, 2X, 3X, Leveraged, Inverse, Bear, Direxion Daily,
+                        ProShares Ultra, ProShares UltraPro, ProShares UltraShort, ProShares Short]
 ```
 
 ### `config/strategy.yaml`
