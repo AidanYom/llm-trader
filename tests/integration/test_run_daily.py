@@ -266,6 +266,23 @@ def test_stale_entries_are_cancelled_before_the_account_is_read(engine: Engine, 
     assert broker.open_orders == list(SMH_LEGS)  # the legs of a held position stay
 
 
+def test_cancelling_a_partially_filled_entry_warns_that_its_shares_have_no_stop(
+    engine: Engine, conn: Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    partial = replace(STALE_ENTRY, filled_qty=3)
+    broker = fake_broker(open_orders=[*SMH_LEGS, partial])
+
+    result = run(engine, research_then_submit(), broker=broker)
+
+    assert result.summary.splitlines()[-2:] == [
+        "Shares with no stop, from partially filled entries cancelled with their stops:",
+        "  IGV: 3 shares (entry igv-entry)",
+    ]
+    (warning,) = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert warning.getMessage() == "cancelled a partially filled entry, leaving its shares with no stop"
+    assert (warning.__dict__["symbol"], warning.__dict__["filled_qty"]) == ("IGV", 3)
+
+
 def test_an_exit_cancels_its_legs_before_selling(engine: Engine, conn: Connection) -> None:
     broker = fake_broker(open_orders=list(SMH_LEGS))
 

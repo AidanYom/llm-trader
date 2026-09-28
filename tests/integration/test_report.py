@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -11,7 +12,9 @@ import pytest
 from sqlalchemy import Connection, Engine
 
 from trader.__main__ import main
-from trader.models import RunMode
+from trader.brokers.base import BrokerError
+from trader.brokers.fake import FakeBroker
+from trader.models import Bar, RunMode
 from trader.offline import offline_broker, offline_client
 from trader.report import baseline_return, write_report
 from trader.run import run_daily, utc_now
@@ -92,6 +95,76 @@ def test_reports_on_real_runs_leave_offline_ones_out(
 
     assert path.name == "week-2026-09-29.md"
     assert path.read_text(encoding="utf-8").endswith("No dry_run or submit runs in this window.\n")
+
+
+class NoBars(FakeBroker):
+    """A broker whose bars request fails, as Alpaca's can."""
+
+    def get_daily_bars(self, symbols: Sequence[str], sessions: int) -> dict[str, list[Bar]]:
+        raise BrokerError("read daily bars for XLK and 10 more: HTTP 403: subscription does not permit that")
+
+
+def dry_run(engine: Engine, now: datetime) -> None:
+    run_daily(
+        mode=RunMode.DRY_RUN,
+        config=CONFIG,
+        engine=engine,
+        broker=offline_broker(now),
+        client=offline_client(),
+        clock=lambda: now,
+    )
+
+
+def test_a_broker_failure_leaves_just_the_baseline_out(
+    engine: Engine, conn: Connection, tmp_path: Path
+) -> None:
+    dry_run(engine, MONDAY)
+
+    path = write_report(
+        engine,
+        today=date(2026, 9, 29),
+        days=7,
+        paper=True,
+        offline=False,
+        basket=CONFIG.strategy.baseline_basket,
+        broker=NoBars(now=TUESDAY),
+        directory=tmp_path,
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert (
+        ", close before 2026-09-28 to close before 2026-09-28: n/a: read daily bars for XLK and 10 more: "
+        in text
+    )
+    assert "## Daily log" in text
+
+
+def test_trader_report_on_real_runs_needs_the_keys_only_for_the_baseline(
+    engine: Engine,
+    conn: Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dry_run(engine, utc_now())  # dated today, so it falls in the report's window
+    shutil.copytree(REPO_ROOT / "config", tmp_path / "config")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DATABASE_URL", os.environ["TEST_DATABASE_URL"])
+    monkeypatch.delenv("ALPACA_PAPER", raising=False)
+
+    assert main(["report"]) == 1
+    assert capsys.readouterr().err.startswith("trader: ALPACA_API_KEY is not set")
+
+    assert main(["report", "--no-baseline"]) == 0
+    (written,) = (tmp_path / "reports").iterdir()
+    assert ": skipped (--no-baseline)" in written.read_text(encoding="utf-8")
+
+    monkeypatch.setattr("trader.__main__._alpaca", lambda secrets: offline_broker(utc_now()))
+    assert main(["report"]) == 0
+    baseline = next(
+        line for line in written.read_text(encoding="utf-8").splitlines() if line.startswith("- Baseline")
+    )
+    assert "n/a" not in baseline
 
 
 def test_trader_report_offline(

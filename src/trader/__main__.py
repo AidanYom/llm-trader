@@ -1,4 +1,4 @@
-"""The `trader` command (HANDOFF §12): `trader run` and `trader report`, and `trader smoke` from M4.
+"""The `trader` command (HANDOFF §12): `trader run`, `trader report` and `trader smoke`.
 
 argparse, Python's standard command-line parser, reads the arguments. This module only wires config,
 secrets, the database, a broker and a model client together, and prints what comes back; the logic lives
@@ -12,6 +12,9 @@ import os
 import sys
 from pathlib import Path
 
+from trader.agent import ModelClient, anthropic_client
+from trader.brokers.alpaca import AlpacaBroker
+from trader.brokers.base import Broker
 from trader.db.engine import DatabaseUrlError, make_engine
 from trader.db.repo import SchemaVersionError
 from trader.logs import configure_logging
@@ -19,7 +22,15 @@ from trader.models import RunMode, new_york_date
 from trader.offline import offline_broker, offline_client
 from trader.report import write_report
 from trader.run import ForceRefusedError, LiveMoneyError, run_daily, utc_now
-from trader.settings import ConfigError, SecretError, Secrets, alpaca_paper, load_config
+from trader.settings import (
+    ConfigError,
+    SecretError,
+    Secrets,
+    alpaca_data_feed,
+    alpaca_paper,
+    load_config,
+)
+from trader.smoke import run_smoke
 
 # Errors a user can fix. They're printed as one line; anything else keeps its traceback.
 USER_ERRORS = (
@@ -47,7 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         required=True,
         choices=["offline", "dry-run", "submit"],
-        help="offline: FakeBroker and a scripted model; dry-run: no orders; submit: real orders",
+        help="offline: FakeBroker and a scripted model; dry-run: Alpaca and Claude, but no orders; "
+        "submit: real orders",
     )
     run.add_argument(
         "--force", action="store_true", help="first abandon today's stale running submit run (submit mode)"
@@ -65,6 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument(
         "--offline", action="store_true", help="report on offline runs instead of dry-run and submit runs"
     )
+    commands.add_parser(
+        "smoke",
+        help="read-only checks of the Alpaca account and market data",
+        description="Read the Alpaca account, its configuration, the calendar, bars and news, and report "
+        "what came back (HANDOFF §8). It never places or cancels an order. Needs the Alpaca keys.",
+    )
     return parser
 
 
@@ -72,7 +90,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
-        return _report(args) if args.command == "report" else _run(args)
+        if args.command == "report":
+            return _report(args)
+        if args.command == "smoke":
+            return _smoke()
+        return _run(args)
     except USER_ERRORS as exc:
         print(f"trader: {exc}", file=sys.stderr)
         return 1
@@ -92,10 +114,15 @@ def _report(args: argparse.Namespace) -> int:
     config = load_config(Path.cwd())
     paper = alpaca_paper(os.environ)
     now = utc_now()
-    # Offline runs' baseline comes from the same fake bars they traded on. The Alpaca adapter, for real runs,
-    # arrives in M4; until then their baseline shows as n/a.
-    broker = offline_broker(now, paper=paper) if args.offline else None
-    engine = make_engine(Secrets(os.environ).get("DATABASE_URL"))
+    secrets = Secrets(os.environ)
+    # The baseline's closes: offline runs' come from the same fake bars they traded on, and real runs' from
+    # Alpaca, which needs the keys. --no-baseline needs neither.
+    broker: Broker | None = None
+    if args.offline:
+        broker = offline_broker(now, paper=paper)
+    elif not args.no_baseline:
+        broker = _alpaca(secrets)
+    engine = make_engine(secrets.get("DATABASE_URL"))
     try:
         path = write_report(
             engine,
@@ -113,19 +140,38 @@ def _report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _smoke() -> int:
+    """Exit 1 if any read failed. Warnings, such as account settings to change, leave it at 0."""
+    report = run_smoke(_alpaca(Secrets(os.environ)), now=utc_now(), feed=alpaca_data_feed(os.environ))
+    print(report.text)
+    return 1 if report.failures else 0
+
+
+def _alpaca(secrets: Secrets) -> AlpacaBroker:
+    """The Alpaca account that ALPACA_PAPER names. Building it makes no network call."""
+    return AlpacaBroker.connect(
+        api_key=secrets.get("ALPACA_API_KEY"),
+        secret_key=secrets.get("ALPACA_SECRET_KEY"),
+        paper=alpaca_paper(os.environ),
+        feed=alpaca_data_feed(os.environ),
+    )
+
+
 def _run(args: argparse.Namespace) -> int:
     mode = RunMode(args.mode.replace("-", "_"))
-    if mode is not RunMode.OFFLINE:
-        print(
-            f"trader: --mode {args.mode} needs the Alpaca adapter and the Claude client (M4)", file=sys.stderr
-        )
-        return 2
     config = load_config(Path.cwd())
-    broker = offline_broker(utc_now(), paper=alpaca_paper(os.environ))
-    engine = make_engine(Secrets(os.environ).get("DATABASE_URL"))
+    secrets = Secrets(os.environ)
+    broker: Broker
+    client: ModelClient
+    if mode is RunMode.OFFLINE:
+        broker, client = offline_broker(utc_now(), paper=alpaca_paper(os.environ)), offline_client()
+    else:
+        # Every key is read before the run starts, so a missing one stops it before it writes anything.
+        broker, client = _alpaca(secrets), anthropic_client(secrets.get("ANTHROPIC_API_KEY"))
+    engine = make_engine(secrets.get("DATABASE_URL"))
     try:
         result = run_daily(
-            mode=mode, config=config, engine=engine, broker=broker, client=offline_client(), force=args.force
+            mode=mode, config=config, engine=engine, broker=broker, client=client, force=args.force
         )
     finally:
         engine.dispose()

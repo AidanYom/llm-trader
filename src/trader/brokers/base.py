@@ -1,4 +1,4 @@
-"""The broker interface (HANDOFF §8), implemented by FakeBroker and, from M4, the Alpaca adapter.
+"""The broker interface (HANDOFF §8), implemented by AlpacaBroker (alpaca.py) and FakeBroker (fake.py).
 
 `Broker` is a `typing.Protocol`: an interface checked by shape, so an implementation needn't inherit from it.
 Only run.py sends orders through it (CLAUDE.md invariant 2).
@@ -22,6 +22,27 @@ class BrokerError(RuntimeError):
 class CancelledOrder:
     broker_order_id: str
     symbol: str
+    # Shares the order had bought before it was cancelled. A cancelled entry's legs go with it, so these are
+    # left with no stop (HANDOFF §8 and §20).
+    filled_qty: float = 0.0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AccountSettings:
+    """The Alpaca account's own settings, which `trader smoke` checks (HANDOFF §8). Not part of Broker.
+
+    Aidan sets them in Alpaca; the app never changes them.
+    """
+
+    status: str  # ACTIVE when the account can trade
+    trading_blocked: bool
+    account_blocked: bool
+    trade_suspended_by_user: bool
+    suspend_trade: bool  # the configuration's switch for the same thing
+    buying_power: float
+    no_shorting: bool
+    max_margin_multiplier: float
+    max_options_trading_level: int | None  # None when Alpaca leaves it unset
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

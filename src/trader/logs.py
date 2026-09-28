@@ -15,6 +15,10 @@ from datetime import UTC, datetime
 # Attributes every LogRecord has; anything else on a record came from `extra`.
 _STANDARD = frozenset(vars(logging.LogRecord("", 0, "", 0, "", None, None))) | {"message", "asctime"}
 
+# The SDKs' loggers, and the HTTP libraries' under them, stay at INFO or above even when LOG_LEVEL is DEBUG:
+# at DEBUG the Anthropic SDK logs whole request bodies and response headers (HANDOFF §9).
+SDK_LOGGERS = ("anthropic", "httpx2", "httpcore2", "urllib3", "alpaca")
+
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -40,3 +44,5 @@ def configure_logging(level: str = "INFO") -> None:
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(name)
+    for sdk in SDK_LOGGERS:
+        logging.getLogger(sdk).setLevel(max(logging.INFO, root.level))

@@ -22,6 +22,8 @@ make migrate   # create the tables in the dev database
 
 API keys are only needed for `make smoke`, `make dry-run` and `make submit`. For those, copy `.env.example` to `.env` (gitignored) and fill in the keys. Keep `ALPACA_PAPER=true`.
 
+**What costs money:** `make dry-run` and `make submit` call Claude, roughly $0.10–0.40 a run. The tests, `make offline` and `make smoke` are free: the tests and offline mode never touch the network, and smoke only reads from Alpaca's free plan.
+
 ## Make targets
 
 Each target is a single `docker compose` command. Targets for later milestones fail until that milestone lands. The targets that run the app (`offline`, `dry-run`, `submit`, `report`, `smoke`) pass `ARGS` on, for example `make offline ARGS=--show-briefing`.
@@ -41,7 +43,7 @@ Each target is a single `docker compose` command. Targets for later milestones f
 | `make revision m="add x"` | Autogenerate a migration, then review it by hand | `docker compose run --rm app alembic revision --autogenerate -m "add x"` | M2 |
 | `make offline` | Full run with the fake broker and a scripted model | `docker compose run --rm app trader run --mode offline $(ARGS)` | M3 |
 | `make report` | Weekly markdown report into `reports/` | `docker compose run --rm app trader report $(ARGS)` | M3 |
-| `make smoke` | Read-only Alpaca check (needs keys) | `docker compose run --rm app trader smoke $(ARGS)` | M4 |
+| `make smoke` | Read-only Alpaca check (needs keys) | `docker compose run --rm --no-deps app trader smoke $(ARGS)` | M4 |
 | `make dry-run` | Real Alpaca and Claude, no orders (needs keys) | `docker compose run --rm app trader run --mode dry-run $(ARGS)` | M4 |
 | `make submit` | Real paper orders (needs keys) | `docker compose run --rm app trader run --mode submit $(ARGS)` | M4 |
 
@@ -56,12 +58,29 @@ M5 adds `image`, `push`, `deploy` and `migrate-prod`.
 3. The risk engine decides on the model's proposals.
 4. Approved orders go to the broker.
 
-Everything lands in the database. The run prints a one-screen summary; logs are JSON lines on stdout, at `LOG_LEVEL` (default `INFO`).
+Everything lands in the database. The run prints a one-screen summary. Logs are JSON lines on stdout, at `LOG_LEVEL` (default `INFO`); the SDKs' own loggers stay at `INFO` or above even at `DEBUG`, so request bodies and headers never reach the logs.
 
 - **Offline mode** (`make offline`) needs no keys. It runs the fixed scenario in `src/trader/offline.py`: a fake $10,000 account, a scripted model, a buy, an exit, a blocked buy and a malformed proposal, so every table gets a row. Its fake market is open every day.
+- **Dry-run mode** (`make dry-run`) runs against the Alpaca account `ALPACA_PAPER` names and against Claude, and records every order as `not_submitted`. It never changes the account, so each dry run starts from the account as it is, and dry runs never count toward the weekly new-position limit. It runs at any time of day, but only on trading days.
+- **Submit mode** (`make submit`) sends the approved orders to Alpaca, after cancelling earlier runs' unfilled entries. If one of those entries was partially filled, its shares are left with no stop; the summary lists them (HANDOFF §20).
 - **`--show-briefing`** prints the briefing the model saw, before the summary.
 - **`--force`**, in submit mode, first abandons the day's `running` submit run, for example one left by a crash. It refuses if that run started less than 20 minutes ago, since it may still be going.
-- **Dry-run and submit** need the Alpaca adapter and the Claude client, which arrive in M4.
+- **A run is refused or skipped when:**
+  - the database isn't at the code's migration revision
+  - the account is live and `allow_live_money` is false
+  - the market is closed
+  - a submit run already completed that day
+
+## Smoke check
+
+`trader smoke` (`make smoke`) is the first thing to run with real keys. It only reads, never touches the database, and prints what came back:
+
+- the account, its status and its configuration, with a warning unless `no_shorting` is true, `max_margin_multiplier` is 1 and `max_options_trading_level` is 0 or unset. You set these in Alpaca's dashboard; the app never changes them.
+- the calendar: today, the next sessions and the last completed one
+- 70 sessions of bars for SPY and XLK, and a bars request with a made-up ticker, which should be left out
+- the last 24 hours of market news, and SPY's news
+
+It exits 1 if any read failed. Warnings leave the exit code at 0.
 
 ## Weekly report
 
@@ -82,12 +101,9 @@ Everything lands in the database. The run prints a one-screen summary; logs are 
 - **Current positions.**
 - **Daily log:** each proposal with its thesis, invalidation and verdict.
 
-`--offline` reports on offline runs instead, into a file ending `-offline.md`: `make report ARGS=--offline`. Until M4 adds the Alpaca adapter, a report on real runs shows the baseline as n/a.
-- **A run is refused or skipped when:**
-  - the database isn't at the code's migration revision
-  - the account is live and `allow_live_money` is false
-  - the market is closed
-  - a submit run already completed that day
+The baseline for real runs reads Alpaca's bars, so it needs the Alpaca keys; `--no-baseline` doesn't. If Alpaca fails, the report still renders and the baseline says why it's missing.
+
+`--offline` reports on offline runs instead, into a file ending `-offline.md`: `make report ARGS=--offline`. Its baseline comes from the fake broker's bars.
 
 ## Dependencies
 
@@ -147,6 +163,8 @@ The app reads `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ANTHROPIC_API_KEY` and `DA
 - Otherwise it reads the SSM SecureString parameter that `NAME_SSM` names. That's how the Lambda function gets them (M5).
 
 `ALPACA_PAPER` must be `true` (the default when unset) or `false`. Anything else stops the app, so a typo can't point it at a live account.
+
+`ALPACA_DATA_FEED` must be `sip` (the default when unset) or `delayed_sip`: both give consolidated volume for history older than 15 minutes, which the liquidity limits assume. Other feeds, such as `iex`, stop the app.
 
 ## Database
 

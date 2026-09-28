@@ -15,6 +15,7 @@ from trader.settings import (
     SecretError,
     Secrets,
     SsmClient,
+    alpaca_data_feed,
     alpaca_paper,
     assemble_system_prompt,
     load_config,
@@ -326,3 +327,17 @@ def test_alpaca_paper_defaults_to_true(value: str | None, expected: bool) -> Non
 def test_alpaca_paper_refuses_anything_but_true_or_false(value: str) -> None:
     with pytest.raises(ConfigError, match="ALPACA_PAPER must be true or false"):
         alpaca_paper({"ALPACA_PAPER": value})
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, "sip"), ("", "sip"), ("sip", "sip"), (" SIP ", "sip"), ("delayed_sip", "delayed_sip")],
+)
+def test_alpaca_data_feed_defaults_to_sip(value: str | None, expected: str) -> None:
+    assert alpaca_data_feed({} if value is None else {"ALPACA_DATA_FEED": value}) == expected
+
+
+@pytest.mark.parametrize("value", ["iex", "otc", "boats", "overnight", "sips"])
+def test_alpaca_data_feed_refuses_feeds_without_consolidated_volume(value: str) -> None:
+    with pytest.raises(ConfigError, match="ALPACA_DATA_FEED must be sip or delayed_sip"):
+        alpaca_data_feed({"ALPACA_DATA_FEED": value})

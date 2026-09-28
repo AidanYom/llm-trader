@@ -59,3 +59,8 @@ explicit_package_bases = true
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config", "--import-mode=importlib"]
 xfail_strict = true
+filterwarnings = [
+    # alpaca-py's trading package imports its streaming client, built on websockets.legacy; the app never
+    # streams. Python hides this outside pytest, since it comes from third-party code.
+    "ignore:websockets.legacy is deprecated:DeprecationWarning",
+]

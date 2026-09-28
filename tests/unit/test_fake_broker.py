@@ -139,6 +139,15 @@ def test_cancelling_stale_entries_leaves_the_legs() -> None:
     assert broker.cancel_open_buy_orders() == []
 
 
+def test_a_cancelled_entry_reports_the_shares_it_had_bought() -> None:
+    partial = OpenOrder(broker_order_id="o-1", symbol="IGV", side=Side.BUY, filled_qty=3)
+    broker = FakeBroker(now=MONDAY_PREMARKET, open_orders=[partial])
+
+    assert broker.cancel_open_buy_orders() == [
+        CancelledOrder(broker_order_id="o-1", symbol="IGV", filled_qty=3.0)
+    ]
+
+
 def test_cancelling_a_symbols_open_orders() -> None:
     broker = FakeBroker(now=MONDAY_PREMARKET, open_orders=[STALE_ENTRY, STOP_LEG, TAKE_PROFIT_LEG])
 

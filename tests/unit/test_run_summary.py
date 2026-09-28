@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 
 from trader.agent import MalformedProposal
+from trader.brokers.base import CancelledOrder
 from trader.db.repo import NewRun
 from trader.models import (
     AccountState,
@@ -90,6 +91,15 @@ def test_summary_lists_malformed_proposals_and_says_when_there_is_nothing() -> N
         "Malformed proposals: 1",
         "  action: 'hold' is not buy or sell",
         "Orders: none",
+    ]
+
+
+def test_summary_names_shares_a_cancelled_entry_left_with_no_stop() -> None:
+    lines = summary(unprotected=[CancelledOrder(broker_order_id="o-7", symbol="IGV", filled_qty=3.0)])
+
+    assert lines[-2:] == [
+        "Shares with no stop, from partially filled entries cancelled with their stops:",
+        "  IGV: 3 shares (entry o-7)",
     ]
 
 
