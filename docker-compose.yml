@@ -54,5 +54,29 @@ services:
       - ~/.aws:/root/.aws:ro
     depends_on: !reset []
 
+  # Terraform and the AWS CLI, pinned (HANDOFF §12): make tf, plan, deploy, aws, secret, invoke and logs. Both
+  # use your AWS credentials from ~/.aws. The Terraform version is pinned in .github/workflows/ci.yml too.
+  terraform:
+    image: hashicorp/terraform:1.16.4
+    profiles: [ops]
+    working_dir: /infra
+    volumes:
+      - ./infra:/infra
+      - terraform:/infra/.terraform # providers and backend settings, kept off the slow Windows bind mount
+      - ~/.aws:/root/.aws:ro
+    environment:
+      AWS_PROFILE: ${AWS_PROFILE:-llm-trader}
+      AWS_REGION: us-east-1
+
+  aws:
+    image: amazon/aws-cli:2.37.4
+    profiles: [ops]
+    volumes:
+      - ~/.aws:/root/.aws # writable: aws configure and aws sso login save settings and tokens here
+    environment:
+      AWS_PROFILE: ${AWS_PROFILE:-llm-trader}
+      AWS_REGION: us-east-1
+
 volumes:
   pgdata:
+  terraform:
