@@ -40,7 +40,7 @@ from alpaca.trading.enums import (
     QueryOrderStatus,
     TimeInForce,
 )
-from alpaca.trading.models import AccountConfiguration, Calendar, TradeAccount
+from alpaca.trading.models import AccountConfiguration, Asset, Calendar, TradeAccount
 from alpaca.trading.models import Order as AlpacaOrder
 from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.requests import (
@@ -69,6 +69,7 @@ ORDERS_LIMIT = 500  # the most orders one listing returns
 CANCEL_POLL_S = 0.5  # HANDOFF §8: how often to check whether a cancel has landed
 CANCEL_WAIT_S = 8.0  # and for how long
 CLOCK_SKEW = timedelta(seconds=30)  # allowed between this machine's clock and Alpaca's
+NOT_FOUND = 404  # Alpaca's status for an asset it doesn't know
 # A cancel has landed once the order is in one of these (HANDOFF §8).
 FINISHED = frozenset(
     {
@@ -92,6 +93,8 @@ class TradingApi(Protocol):
     def get_all_positions(self) -> list[AlpacaPosition] | RawData: ...
 
     def get_calendar(self, filters: GetCalendarRequest | None = None, /) -> list[Calendar] | RawData: ...
+
+    def get_asset(self, symbol_or_asset_id: UUID | str, /) -> Asset | RawData: ...
 
     def get_orders(self, filter: GetOrdersRequest | None = None, /) -> list[AlpacaOrder] | RawData: ...
 
@@ -212,6 +215,21 @@ class AlpacaBroker:
         if skipped:
             log.warning("skipped malformed news stories", extra={"skipped": skipped, "about": about})
         return items[:limit]
+
+    def get_asset_names(self, symbols: Sequence[str]) -> dict[str, str]:
+        """Each symbol's name as Alpaca lists it. A symbol Alpaca doesn't know, or can't name, is left out."""
+        names: dict[str, str] = {}
+        for symbol in symbols:
+            with _broker_errors(f"read the asset {symbol}"):
+                try:
+                    asset = _model(self._trading.get_asset(symbol), Asset)
+                except APIError as exc:
+                    if exc.status_code != NOT_FOUND:
+                        raise
+                    continue
+                if asset.name:
+                    names[symbol] = asset.name
+        return names
 
     # ---- Broker: orders ------------------------------------------------------------------------------------
 

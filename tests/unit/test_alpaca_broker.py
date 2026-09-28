@@ -28,7 +28,7 @@ from alpaca.data.requests import NewsRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrameUnit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, OrderStatus, QueryOrderStatus
-from alpaca.trading.models import AccountConfiguration, Calendar, TradeAccount
+from alpaca.trading.models import AccountConfiguration, Asset, Calendar, TradeAccount
 from alpaca.trading.models import Order as AlpacaOrder
 from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.requests import GetCalendarRequest, GetOrdersRequest, OrderRequest
@@ -102,6 +102,23 @@ def configuration(**fields: Any) -> AccountConfiguration:
         "max_options_trading_level": 0,
     }
     return AccountConfiguration(**(data | fields))
+
+
+def asset(symbol: str, name: str | None) -> Asset:
+    data: dict[str, Any] = {
+        "id": "7f4c9f61-3a55-4f5a-8d0b-2b1a0c6d9e11",
+        "class": "us_equity",
+        "exchange": "ARCA",
+        "symbol": symbol,
+        "name": name,
+        "status": "active",
+        "tradable": True,
+        "marginable": True,
+        "shortable": True,
+        "easy_to_borrow": True,
+        "fractionable": True,
+    }
+    return Asset(**data)
 
 
 def session(day: str) -> Calendar:
@@ -198,11 +215,13 @@ class FakeTrading:
         config: AccountConfiguration | None = None,
         orders: Sequence[AlpacaOrder] = (),
         groups: Sequence[Sequence[int]] = (),
+        assets: Sequence[Asset] = (),
     ) -> None:
         self.account = trade_account() if account is None else account
         self.positions = list(positions)
         self.sessions = list(sessions)
         self.config = configuration() if config is None else config
+        self.assets = {asset.symbol: asset for asset in assets}
         self.orders = {str(order.id): order for order in orders}  # Alpaca's state, by order ID
         self.groups = [{uid(number) for number in group} for group in groups]  # cancelled together
         self.pending_checks: dict[str, int] = {}  # status checks an order's cancel stays pending for
@@ -236,6 +255,13 @@ class FakeTrading:
     def get_calendar(self, filters: GetCalendarRequest | None = None, /) -> list[Calendar] | dict[str, Any]:
         self._call(filters)
         return self.sessions
+
+    def get_asset(self, symbol_or_asset_id: UUID | str, /) -> Asset | dict[str, Any]:
+        self._call(symbol_or_asset_id)
+        asset = self.assets.get(str(symbol_or_asset_id))
+        if asset is None:
+            raise api_error(404, "asset not found")
+        return asset
 
     # Each call returns copies, as the API does: the adapter compares an order's states over time.
 
@@ -807,6 +833,28 @@ def test_a_failed_submit_with_no_order_at_alpaca_keeps_its_own_error() -> None:
 
     with pytest.raises(BrokerError, match="^submit buy 10 XLE: HTTP 403: .*insufficient buying power"):
         broker(trading).submit(BUY, CLIENT_ID)
+
+
+# ---- Asset names -------------------------------------------------------------------------------------------
+
+
+def test_asset_names_are_alpacas_and_an_unknown_or_nameless_symbol_is_left_out() -> None:
+    trading = FakeTrading(
+        assets=[asset("TECL", "Direxion Daily Technology Bull 3X Shares"), asset("NONAME", None)]
+    )
+
+    names = broker(trading).get_asset_names(["TECL", "NOSUCHSYM", "NONAME"])
+
+    assert names == {"TECL": "Direxion Daily Technology Bull 3X Shares"}
+    assert trading.requests == ["TECL", "NOSUCHSYM", "NONAME"]
+
+
+def test_an_asset_lookup_that_fails_otherwise_is_an_error() -> None:
+    trading = FakeTrading()
+    trading.failure = api_error(500, "internal error")
+
+    with pytest.raises(BrokerError, match="^read the asset TECL: HTTP 500: "):
+        broker(trading).get_asset_names(["TECL"])
 
 
 # ---- Errors ------------------------------------------------------------------------------------------------

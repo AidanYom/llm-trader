@@ -5,6 +5,7 @@
   saw. Sessions are weekdays, minus any holidays given; tests can replace any symbol's bars.
 - "Today" is the New York date of `now`. Bars stop at the session before it, as the Alpaca adapter drops
   today's bar, and the canned news is timed back from `now`.
+- Every symbol has a plain made-up asset name, such as "XLE Fake Fund", unless a test gives it another.
 - It never fills an order. It records cancels and submissions and, like Alpaca, refuses a repeated
   client_order_id. A submitted buy stays open, so a later run on the same broker cancels it as stale.
 """
@@ -56,6 +57,8 @@ class FakeBroker:
         is_paper: bool = True,
         holidays: Collection[date] = (),
         open_every_day: bool = False,  # the offline scenario's market, so make offline works at weekends
+        # Replaces those symbols' made-up names; None means the broker doesn't know the symbol.
+        asset_names: Mapping[str, str | None] | None = None,
     ) -> None:
         self.is_paper = is_paper
         self.today = new_york_date(now)
@@ -64,6 +67,7 @@ class FakeBroker:
         self.open_orders = list(open_orders)
         self.news = tuple(canned_news(now) if news is None else news)
         self._bars = dict(bars or {})
+        self._asset_names = dict(asset_names or {})
         self._holidays = frozenset(holidays)
         self._open_every_day = open_every_day
         self.calls: list[str] = []  # the Broker methods called, in order
@@ -101,6 +105,12 @@ class FakeBroker:
         ]
         stories.sort(key=lambda item: item.created_at, reverse=True)
         return stories[: max(limit, 0)]
+
+    def get_asset_names(self, symbols: Sequence[str]) -> dict[str, str]:
+        """A made-up, plain name for every symbol, unless the test gave one."""
+        self.calls.append("get_asset_names")
+        names = {symbol: self._asset_names.get(symbol, f"{symbol} Fake Fund") for symbol in symbols}
+        return {symbol: name for symbol, name in names.items() if name is not None}
 
     def cancel_open_buy_orders(self) -> list[CancelledOrder]:
         self.calls.append("cancel_open_buy_orders")
