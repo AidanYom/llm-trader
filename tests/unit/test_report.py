@@ -12,6 +12,7 @@ from trader.report import (
     Baseline,
     EquityPoint,
     ReportData,
+    average_invested,
     baseline_return,
     equity_series,
     peak_and_worst_drawdown,
@@ -41,6 +42,7 @@ def a_run(day: date, **changes: Any) -> ReportRun:
         "agent_submitted": True,
         "cost_usd": 0.05,
         "equity": 10_000.0,
+        "cash": None,
     }
     return ReportRun(**(fields | changes))
 
@@ -114,9 +116,21 @@ def test_equity_series_has_one_point_a_day_from_completed_runs() -> None:
     ]
 
     assert equity_series(runs) == [
-        EquityPoint(day=MONDAY, equity=10_001.0),
-        EquityPoint(day=MONDAY + timedelta(days=3), equity=10_200.0),
+        EquityPoint(day=MONDAY, equity=10_001.0, cash=None),
+        EquityPoint(day=MONDAY + timedelta(days=3), equity=10_200.0, cash=None),
     ]
+
+
+def test_average_invested_skips_points_without_cash_or_equity() -> None:
+    points = [
+        EquityPoint(day=MONDAY, equity=10_000.0, cash=500.0),  # 95% invested
+        EquityPoint(day=MONDAY + timedelta(days=1), equity=10_000.0, cash=None),
+        EquityPoint(day=MONDAY + timedelta(days=2), equity=0.0, cash=0.0),
+        EquityPoint(day=MONDAY + timedelta(days=3), equity=8_000.0, cash=1_600.0),  # 80% invested
+    ]
+
+    assert average_invested(points) == pytest.approx(0.875)
+    assert average_invested(points[1:3]) is None
 
 
 def test_peak_and_worst_drawdown() -> None:
@@ -140,11 +154,11 @@ def test_an_empty_window_says_so() -> None:
 
 def test_scorecard() -> None:
     runs = [
-        a_run(MONDAY, equity=10_000.0, cost_usd=0.10),
-        a_run(MONDAY + timedelta(days=1), equity=11_000.0, cost_usd=0.10),
+        a_run(MONDAY, equity=10_000.0, cash=1_000.0, cost_usd=0.10),
+        a_run(MONDAY + timedelta(days=1), equity=11_000.0, cash=2_200.0, cost_usd=0.10),
         a_run(MONDAY + timedelta(days=2), status=RunStatus.FAILED, equity=None, cost_usd=0.05, error="Boom"),
-        a_run(MONDAY + timedelta(days=3), equity=9_900.0, cost_usd=0.10),
-        a_run(MONDAY + timedelta(days=4), equity=10_500.0, cost_usd=0.15),
+        a_run(MONDAY + timedelta(days=3), equity=9_900.0, cash=990.0, cost_usd=0.10),
+        a_run(MONDAY + timedelta(days=4), equity=10_500.0, cash=1_050.0, cost_usd=0.15),
         a_run(MONDAY + timedelta(days=5), status=RunStatus.SKIPPED, equity=None, cost_usd=0.0),
         a_run(MONDAY + timedelta(days=5), mode=RunMode.DRY_RUN, equity=None, agent_submitted=False),
     ]
@@ -160,6 +174,7 @@ def test_scorecard() -> None:
     ]
     assert lines[4:] == [
         "- Equity: $10,000.00 on 2026-09-28 → $10,500.00 on 2026-10-02 (+5.0%)",
+        "- Average invested: 87.5% of equity (the baseline is 100%)",  # 90%, 80%, 90% and 90%
         "- Peak equity $11,000.00; worst drawdown in the window 10.0%",
         "- API cost: $0.55 (0.01% of equity)",  # failed runs' cost included
         "- Baseline (equal-weight XLK, XLE), close before 2026-09-28 to close before 2026-10-02: +2.0%; "

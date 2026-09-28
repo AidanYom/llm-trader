@@ -179,11 +179,24 @@ def test_account_lists_positions_largest_first() -> None:
 
     lines = section(briefing(account), "## Account")
 
-    assert lines[0] == "Equity $10,000.00 · cash $8,000.00 (80.0% of equity) · open positions 2 of 6"
+    assert lines[0] == (
+        "Equity $10,000.00 · cash $8,000.00 (80.0% of equity) · invested $2,000.00 (20.0%) · "
+        "open positions 2 of 6"
+    )
     assert lines[3:] == [
         "| SMH | 10 | $120.00 | $120.00 | +5.0% | 12.0% |",
         "| XLE | 10 | $80.00 | $80.00 | +5.0% | 8.0% |",
     ]
+
+
+def test_account_line_shows_how_much_is_invested() -> None:
+    nearly_full = AccountState(equity=10_000.0, cash=1_200.0, positions=(position("XLE", 8_800.0),))
+    unknown = AccountState(
+        equity=10_000.0, cash=1_200.0, positions=(position("XLE", 4_400.0), position("SMH", math.nan))
+    )
+
+    assert "· invested $8,800.00 (88.0%) ·" in section(briefing(nearly_full), "## Account")[0]
+    assert "· invested n/a ·" in section(briefing(unknown), "## Account")[0]
 
 
 def test_account_without_positions_says_so() -> None:
@@ -233,7 +246,7 @@ def test_freeze_banner_shows_exactly_when_buys_are_frozen(equity: float, frozen:
 def test_unusable_account_shows_na_instead_of_failing() -> None:
     text = briefing(AccountState(equity=math.nan, cash=math.nan))
 
-    assert "Equity n/a · cash n/a · open positions 0 of 6" in text
+    assert "Equity n/a · cash n/a · invested $0.00 · open positions 0 of 6" in text
     assert "- Cash available for buys: n/a (the account can't be sized against, so buys are rejected)" in text
     assert "- Drawdown from peak: n/a" in text
 

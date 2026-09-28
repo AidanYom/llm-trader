@@ -101,10 +101,13 @@ def build_briefing(
 def _account(account: AccountState, policy: Policy) -> list[str]:
     equity = _positive(account.equity)
     cash_share = f" ({_share(account.cash, equity)} of equity)" if equity else ""
+    invested = _invested(account)
+    invested_share = f" ({_share(invested, equity)})" if equity and invested is not None else ""
     lines = [
         "## Account",
         "",
         f"Equity {_usd(account.equity)} · cash {_usd(account.cash)}{cash_share} · "
+        f"invested {_usd(invested)}{invested_share} · "
         f"open positions {len(account.positions)} of {policy.max_open_positions}",
         "",
     ]
@@ -275,6 +278,12 @@ def price_history_text(symbol: str, bars: Sequence[Bar], listed: int) -> str:
 # ---- Formatting --------------------------------------------------------------------------------------------
 
 
+def _invested(account: AccountState) -> float | None:
+    """The positions' total market value, or None if any is unknown. The strategy aims for 80–100%."""
+    values = [finite_float(position.market_value) for position in account.positions]
+    return None if None in values else sum(value for value in values if value is not None)
+
+
 def _positive(value: float) -> float | None:
     number = finite_float(value)
     return number if number is not None and number > 0 else None
@@ -289,7 +298,7 @@ def _minus(value: float | None, other: float | None) -> float | None:
     return None if value is None or other is None else value - other
 
 
-def _usd(amount: float) -> str:
+def _usd(amount: float | None) -> str:
     number = finite_float(amount)
     return "n/a" if number is None else f"${number:,.2f}"
 
