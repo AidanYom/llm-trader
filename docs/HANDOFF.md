@@ -498,7 +498,7 @@ Everything runs in Docker; nothing uses the host's Python.
 
 **Dockerfile targets:**
 - `dev`: `python:3.12-slim` plus uv (copied from the official uv image). `uv sync --frozen` installs dev dependencies into `/app/.venv`, which goes on `PATH`.
-- `lambda`: `public.ecr.aws/lambda/python:3.12`. Runtime dependencies come from `uv export --frozen --no-dev` into `${LAMBDA_TASK_ROOT}`, then `src/trader` and `config/` are copied in. `CMD ["trader.lambda_handler.handler"]`. Built with `--platform linux/amd64`.
+- `lambda`: `public.ecr.aws/lambda/python:3.12`. Runtime dependencies come from `uv export --frozen --no-dev` into `${LAMBDA_TASK_ROOT}`, then `src/trader` and `config/` are copied in. `CMD ["trader.lambda_handler.handler"]`. Built with `--platform linux/amd64` and `--provenance=false`: Lambda refuses the image index that Docker's default provenance attestation creates.
 
 **docker-compose.yml:**
 - `db`:
@@ -514,13 +514,21 @@ Everything runs in Docker; nothing uses the host's Python.
   - `DATABASE_URL=postgresql+psycopg://trader:trader@db:5432/trader`
   - `TEST_DATABASE_URL=postgresql+psycopg://trader:trader@db:5432/trader_test`
   - `depends_on` the database being healthy
+- `prod` (added in milestone 5, under the `ops` profile so `docker compose up` never starts it): `app` pointed at production's Neon database, for `make migrate-prod` and `make report-prod`.
+  - `~/.aws` mounted read-only, with `AWS_PROFILE` (default `llm-trader`) and `AWS_REGION=us-east-1`
+  - `DATABASE_URL` blank and `DATABASE_URL_SSM=/llm-trader/DATABASE_URL`, so `Secrets` reads Neon's URL from SSM inside the container. It never goes in `.env`, on a command line or in make's output.
+  - no dependency on the local database
 
 **Makefile** (each target is a one-line `docker compose` command; on Windows, run `make` from WSL2 or Git Bash with make installed):
 - `build`, `up`, `down`, `shell`, `psql`
 - `lint` (`ruff check` + `ruff format --check` + `mypy`), `fmt`, `test`
 - `migrate` (`alembic upgrade head`), `revision m="…"` (autogenerate)
 - `offline`, `dry-run`, `submit`, `report`, `smoke`, each passing `ARGS=…` to the command, for example `make report ARGS=--offline`
-- added in milestone 5: `image`, `push`, `deploy`, `migrate-prod`
+- added in milestone 5:
+  - `image`: build the `lambda` image tagged with the short git SHA, then check it with no network (section 15)
+  - `migrate-prod` and `report-prod`: `alembic upgrade head` and `trader report` through the `prod` service
+  - `push` and `deploy`, with the Terraform (section 16)
+- The Makefile exports `MSYS_NO_PATHCONV=1`, so Git Bash passes path-like arguments to Docker unchanged.
 
 **Config paths** (`config/policy.yaml`, `config/strategy.yaml`, and the prompt paths inside it) are relative to the working directory: `/app` in the dev container, `/var/task` in the Lambda image.
 
@@ -573,7 +581,7 @@ Everything runs in Docker; nothing uses the host's Python.
   3. `ruff check .`, `ruff format --check .` and `mypy`.
   4. `alembic upgrade head` and `alembic check` (schema drift fails the build).
   5. `pytest -q`.
-- **Job `image`:** `docker build --platform linux/amd64 --target lambda .`, with no push.
+- **Job `image`:** `docker build --platform linux/amd64 --provenance=false --target lambda .`, with no push. Then `docker/lambda_check.py` runs inside the image with no network: it imports the handler the image's CMD names, checks the time-zone data and psycopg's bundled libpq, and invokes the handler with no secrets. `config/` must load and the first secret must be missing.
 
 `main` is protected: merges require a pull request with both jobs green. Private repos on GitHub Free get 2,000 Actions minutes a month, which is far more than this needs.
 
@@ -609,11 +617,15 @@ Everything runs in Docker; nothing uses the host's Python.
 
 **Deploy and migrations:**
 - `make deploy`: build the `lambda` image tagged with the short git SHA, push it to ECR, then `terraform apply -var image_tag=<sha>`.
-- `make migrate-prod`: run `alembic upgrade head` in the dev container against Neon. Run it before deploying any image that needs a new schema; the startup schema check enforces this.
+- `make migrate-prod`: run `alembic upgrade head` in the dev container against Neon, through the `prod` Compose service (section 13). Alembic's `env.py` reads `DATABASE_URL` through `Secrets`, like the app, so it can come from SSM. Run it before deploying any image that needs a new schema; the startup schema check enforces this.
+- `make report-prod`: the weekly report (section 11) against Neon, the same way. Production's runs live there, so `make report`, which reads the dev database, can't see them.
+- Once production runs, don't run `make submit` locally. It records to the dev database, where the one-submit-run-per-day index can't see the Lambda's run, so both could trade on the same day. `make dry-run` never sends orders.
 
 **Lambda handler** (`trader.lambda_handler.handler`):
-- Mode comes from `event["mode"]` or `RUN_MODE`, and must be `dry_run` or `submit`.
-- Resolve secrets, run `run_daily`, and return `{run_id, status, summary}`.
+- Mode comes from `event["mode"]` or `RUN_MODE`, and must be `dry_run` or `submit`. A missing, null or empty `mode` in the event falls back to `RUN_MODE`. Any other value fails before a secret is read or Claude is called, so invoking `{"mode": "bogus"}` is a free way to test the alarm.
+- `event["force"]`, true or false (default false), first abandons the day's stale `running` submit run, as `--force` does (section 9). A run stuck `running` after a Lambda timeout can then be retried from the Lambda instead of locally.
+- Resolve secrets once per execution environment, so warm invocations reuse them. Build the database engine per invocation and dispose of it afterwards. Run `run_daily`, and return `{run_id, status, summary}` as strings.
+- A failed run re-raises, so the invocation fails and the function's `Errors` alarm counts it.
 
 **Rollout:** deploy with `run_mode = dry_run`, review about a week of briefings and verdicts, then apply `run_mode = submit`.
 

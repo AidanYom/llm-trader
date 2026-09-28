@@ -1,7 +1,14 @@
 # Every target is one docker compose command; nothing runs on the host's Python (HANDOFF §13).
 # On Windows, run make from Git Bash or WSL2. README.md lists each target's raw command.
 
-.PHONY: build up down shell psql lint fmt test lock migrate revision offline dry-run submit report smoke
+.PHONY: build up down shell psql lint fmt test lock migrate revision offline dry-run submit report smoke \
+	image migrate-prod report-prod
+
+# Git Bash rewrites arguments that look like Unix paths, such as /dev/null; Docker needs them as written.
+export MSYS_NO_PATHCONV := 1
+
+# The Lambda image's tag: the commit it's built from (HANDOFF §16).
+TAG := $(shell git rev-parse --short HEAD)
 
 build:
 	docker compose build
@@ -52,3 +59,18 @@ report:
 
 smoke:
 	docker compose run --rm --no-deps app trader smoke $(ARGS)
+
+# ---- Production (HANDOFF §16) ----
+
+# Build the Lambda image, then check it without the network: it must import the handler and load config/.
+# Lambda refuses the image index Docker's default provenance attestation creates, hence --provenance=false.
+image:
+	docker build --platform linux/amd64 --provenance=false --sbom=false --target lambda -t llm-trader:$(TAG) .
+	docker run --rm -i --network none --entrypoint python llm-trader:$(TAG) - < docker/lambda_check.py
+
+# Against Neon, whose URL the prod service reads from SSM with your AWS credentials.
+migrate-prod:
+	docker compose run --rm prod alembic upgrade head
+
+report-prod:
+	docker compose run --rm prod trader report $(ARGS)
