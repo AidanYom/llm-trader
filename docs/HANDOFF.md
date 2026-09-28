@@ -90,7 +90,7 @@ The initial contents of both files are in Appendix A. In short:
   - Tool errors, `Invalid symbol.` and cut-off calls are sent with `is_error: true`.
   - Append the assistant's `response.content` to `messages` unchanged. Tool results go back as `tool_result` blocks, all of a response's results in one user message.
 - **Proposal parsing:**
-  - `market_view` is kept if it's a string. `proposals` must be a list; otherwise the whole value is stored as one malformed proposal.
+  - `market_view` is kept if it's a string. `proposals` must be a list; otherwise the whole `submit_proposals` input is stored as one malformed proposal.
   - Each proposal must be an object. Required fields: a string `symbol`, `action` ∈ {buy, sell} exactly, and a non-empty `thesis` and `invalidation`.
   - The symbol is stripped and uppercased but not validated. The risk engine rejects an invalid one under `symbol`, so it shows in the report's rejection reasons. `proposals.raw` keeps what the model sent.
   - Numeric fields: null and an empty string mean absent. Ints, floats and numeric strings are coerced to float; booleans and anything else are malformed. `stop_pct` and `take_profit_pct` are optional, with 0 also treated as absent. `confidence` defaults to 0.5.

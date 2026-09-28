@@ -188,6 +188,37 @@ def test_fail_run_records_the_error_and_leaves_other_states_alone(conn: Connecti
     assert (row_of(conn, abandoned).status, row_of(conn, abandoned).error) == ("abandoned", None)
 
 
+def test_failed_run_keeps_its_usage(conn: Connection) -> None:
+    run_id = started(conn)
+    usage = Usage(
+        input_tokens=9_000, output_tokens=700, cache_write_tokens=6_000, cache_read_tokens=0, cost_usd=0.04
+    )
+
+    repo.fail_run(conn, run_id, finished_at=FINISHED, error="APIStatusError: overloaded", usage=usage)
+
+    row = row_of(conn, run_id)
+    assert (row.status, row.error) == ("failed", "APIStatusError: overloaded")
+    tokens = (row.input_tokens, row.output_tokens, row.cache_write_tokens, row.cache_read_tokens)
+    assert tokens == (9_000, 700, 6_000, 0)
+    assert row.cost_usd == Decimal("0.0400")
+
+
+def test_running_submit_run_is_the_days_running_submit_row(conn: Connection) -> None:
+    assert repo.running_submit_run(conn, run_date=DAY, paper=True) is None
+    started(conn, new_run(RunMode.DRY_RUN))
+    started(conn, new_run(paper=False))
+    started(conn, new_run(day=DAY - timedelta(days=1)))
+    assert repo.running_submit_run(conn, run_date=DAY, paper=True) is None
+
+    run_id = started(conn)
+
+    assert repo.running_submit_run(conn, run_date=DAY, paper=True) == repo.RunningRun(
+        run_id=run_id, started_at=STARTED
+    )
+    complete(conn, run_id)
+    assert repo.running_submit_run(conn, run_date=DAY, paper=True) is None
+
+
 def test_prompt_version_is_stored_once(conn: Connection) -> None:
     repo.save_prompt_version(conn, version="0123456789", system_prompt="You are the research agent.")
     repo.save_prompt_version(conn, version="0123456789", system_prompt="You are the research agent.")
