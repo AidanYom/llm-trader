@@ -61,6 +61,7 @@ Keep this section current: update it in the pull request that completes each mil
 | `src/trader/risk.py` | Risk engine: `evaluate(proposals, account, stats, ctx, policy)` | Pure and deterministic; never raises on bad proposals; every trim or reject has a `category: detail` reason (HANDOFF §7) |
 | `src/trader/briefing.py` | Briefing markdown, return math, `get_price_history` text | Pure functions |
 | `src/trader/agent.py` | Tool definitions, the Claude loop, proposal parsing, cost | The only module that calls the Anthropic SDK |
+| `src/trader/scripted.py` | `ScriptedClient`: prepared model responses, for tests and offline mode | Builds SDK types only; never calls the API |
 | `src/trader/brokers/` | `Broker` protocol; `alpaca.py`; `fake.py` | The only place alpaca-py is imported |
 | `src/trader/db/` | `tables.py` (SQLAlchemy Core), `engine.py`, `repo.py` (explicit query functions) | No ORM; all SQL goes through `repo.py` |
 | `src/trader/run.py` | `run_daily()` orchestration, guards, persistence order, summary | The only module that sends orders |
