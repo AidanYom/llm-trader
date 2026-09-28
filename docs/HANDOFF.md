@@ -34,7 +34,8 @@ The account starts on **Alpaca paper trading**. It runs for about three months a
 EventBridge Scheduler 08:31 ET Mon–Fri → Lambda (container image) → trader.run.run_daily()
 
  0. Guards: schema at Alembic head · live-money guard · trading day? (Alpaca calendar) · one submit run per day
- 1. submit mode + trading_enabled: cancel all open BUY orders (yesterday's unfilled entries; their legs go with them)
+ 1. submit mode + trading_enabled: cancel all open BUY orders (yesterday's unfilled entries; their legs go with them),
+    and re-place the stop of any that had partly filled, for the shares it bought
  2. Read account + positions from Alpaca
  3. Risk context from Postgres: equity peak, new positions opened this week
  4. Daily bars for SPY + sector ETFs + industry ETFs (70 sessions); news (24h, market + held symbols)
@@ -152,6 +153,7 @@ The data behind it:
   - A second proposal for an already-seen symbol, in that evaluation order, is rejected as a duplicate. So a sell beats a buy for the same symbol.
 - **`ctx`** carries `new_positions_this_week` and `equity_peak`, both from Postgres (section 9).
 - **`policy`** is the `Policy` that `settings.load_policy()` reads from `config/policy.yaml`. It's a parameter because config is loaded once and passed down, never read globally.
+- **Re-placed stops:** `restored_stop(symbol, filled_qty, stop_price)` builds the stop for the shares of a cancelled, partially filled entry (section 8): a sell of the whole shares it filled, with the stop price the engine approved for that entry, in whole cents. It returns nothing when there's no whole share or no usable price. So every order still comes from this module.
 
 **Sell:** the symbol must be held (otherwise reject: long-only, no shorting). `qty = floor(held qty)` and must be ≥ 1. The verdict is `approved` with a market-order exit and the reason "full exit".
 
@@ -217,14 +219,17 @@ The data behind it:
   - With only a stop: `OrderClass.OTO` plus `StopLossRequest`.
   - With a stop and take-profit: `OrderClass.BRACKET` plus `StopLossRequest` and `TakeProfitRequest`.
   - GTC keeps the protective legs alive after the entry fills. Orders are submitted pre-market and queue for the open, with no extended hours.
-- **Stale entries:** at the start of every submit run, cancel all open BUY orders. Cancelling an unfilled parent cancels its legs.
-  - Alpaca only activates a bracket or OTO order's legs once the entry has completely filled, and cancelling any order in the group cancels the rest. So cancelling a partially filled entry leaves its filled shares with no stop.
-  - `cancel_open_buy_orders` reports each entry's filled quantity, and the run logs a warning and names those shares in its summary (section 20).
+- **Stale entries:** at the start of every submit run, cancel all open BUY orders, and wait for the cancels to land (see "Waiting on cancels"). Cancelling an unfilled parent cancels its legs.
+  - Alpaca only activates a bracket or OTO order's legs once the entry has completely filled, and cancelling any order in the group cancels the rest. So cancelling a partially filled entry would leave its filled shares with no stop.
+  - `cancel_open_buy_orders` reports each entry's filled quantity once its cancel has landed. An entry that filled completely before its cancel landed keeps its legs, so it isn't reported.
+  - **The run re-places a partially filled entry's stop:** a `StopOrderRequest` SELL for the whole shares it filled, with `TimeInForce.GTC`, at the stop price the risk engine approved for the entry (`risk.restored_stop()`). That price comes from the entry's row in `orders`, found by its broker order ID, and the new order's row is recorded against the entry's proposal. A take-profit isn't re-placed.
+  - The run doesn't place the stop, logs an error and names the shares in its summary when the cancel still hasn't landed after the wait (the legs still hold the shares), or when no run in this database recorded the entry. If Alpaca refuses the stop, it's recorded as an `error` order, and the shares are named too.
+  - The stop sells no other order's shares, so placing it cancels nothing else. That matters when the entry topped up a holding whose older shares keep their own stop.
 - **Exits:** cancel every open order for the symbol (its stop and take-profit legs), wait until they're terminal, then send a `MarketOrderRequest` SELL for the full quantity with `TimeInForce.DAY`.
   - Alpaca cancels a bracket's other leg along with the one cancelled, so a cancel that fails because the order is already cancelled, or being cancelled, isn't an error.
   - If an order fills more shares while its cancel is pending, the position has changed: `cancel_open_orders` raises `BrokerError`, and the exit isn't sent.
-- **Waiting on cancels:** poll order status every 0.5 s for up to 8 s, until it's one of canceled, filled, expired, rejected, replaced or done_for_day. Until a cancel lands, the shares stay held for orders. If a cancel hasn't landed after 8 s, `cancel_open_orders` raises `BrokerError`, and the exit is recorded as an `error` order without being sent.
-- **Idempotency:** `client_order_id = f"llmt-{run_date}-{SYMBOL}-{side}"`. The broker rejects duplicates, so a rerun can't double-submit.
+- **Waiting on cancels:** poll order status every 0.5 s for up to 8 s, until it's one of canceled, filled, expired, rejected, replaced or done_for_day. Until a cancel lands, the shares stay held for orders. If a cancel hasn't landed after 8 s, `cancel_open_orders` raises `BrokerError`, and the exit is recorded as an `error` order without being sent. `cancel_open_buy_orders` never raises for a slow cancel: it reports the entry as not landed, and a fill during the wait just updates its filled quantity.
+- **Idempotency:** `client_order_id = f"llmt-{run_date}-{SYMBOL}-{side}"`, or `llmt-{run_date}-{SYMBOL}-stop` for a re-placed stop, so it can't clash with the same day's exit of the symbol. The broker rejects duplicates, so a rerun can't double-submit.
   - alpaca-py itself retries HTTP 429 and 504 responses, order submissions included. So a 504 can hide an order Alpaca accepted, and the retry is then refused as a duplicate.
   - When a submit fails, `AlpacaBroker` looks the order up by `client_order_id`. If Alpaca created it during this call (allowing 30 s of clock skew), it's returned as submitted. Otherwise the failure stands, so a rerun's duplicate is still recorded as an `error` order.
 - **`trader smoke`** is the first thing to run with real keys. It's read-only: its broker type has no cancel or submit method, and it never touches the database. It prints:
@@ -277,7 +282,7 @@ Offline runs are excluded from risk-context queries and from reports.
 - Both are as of the run date: runs dated later are ignored. This week's Monday comes from the America/New_York `run_date`.
 
 **Persistence order:**
-1. The `runs` row is committed immediately. Stale-entry cancels are committed right after the cancel call, and the account snapshot right after the account read.
+1. The `runs` row is committed immediately. Stale-entry cancels are committed right after the cancel call, a re-placed stop's row right after its broker call, and the account snapshot right after the account read.
 2. Proposals, verdicts and tool calls are committed after evaluation.
 3. Each order row is committed right after its broker call, so a crash can never lose the record of a submitted order. An exit's cancelled legs are committed right after the cancel call. A `BrokerError` records the order as `error`, and the run carries on with the next order; any other exception fails the run.
 4. The final summary fields are written and the status is set to `completed`.
@@ -398,6 +403,7 @@ Offline runs are excluded from risk-context queries and from reports.
 - `error` TEXT
 - `created_at` TIMESTAMPTZ default now()
 - No unique index on `client_order_id`. The row is written after the broker call, so such an index could only fire after an order was really placed, and would lose that order's record. The broker's duplicate check and the one-submit-per-day index already make reruns safe.
+- A re-placed stop (section 8) is a `sell` row with a `stop_price`, no limit or take-profit, and `opens_new_position` false. Its `proposal_id` is the partially filled entry's proposal, from an earlier run.
 
 `cancelled_orders`
 - `id` identity primary key
@@ -548,7 +554,7 @@ Everything runs in Docker; nothing uses the host's Python.
   - Its call sequences (cancel then wait, submit then look up, error translation) run against a fake of the alpaca-py clients' public methods. The fake is typed by protocols that mypy checks the real clients satisfy.
   - Nothing patches alpaca-py or `requests`. `make smoke` and dry runs cover the live API.
 - **Unit tests** (no database):
-  - **Risk engine:** normal buy with exact bracket prices; missing or out-of-range stop; trim to max position; an existing holding counts toward the cap; trim to cash after the buffer; price and liquidity floors; the average-dollar-volume trim; under one share; blocklist and unknown symbol; a leveraged or inverse fund's name, and a cash-like fund's name that must not match; no asset name; the drawdown freeze blocks buys but not sells; a sell is a full exit; no shorting; max open positions, with exits freeing slots; the weekly cap across multiple buys in one run; cash shared across buys in one run; duplicates; `target_pct` of 0; a take-profit too close to the entry is dropped.
+  - **Risk engine:** normal buy with exact bracket prices; missing or out-of-range stop; trim to max position; an existing holding counts toward the cap; trim to cash after the buffer; price and liquidity floors; the average-dollar-volume trim; under one share; blocklist and unknown symbol; a leveraged or inverse fund's name, and a cash-like fund's name that must not match; no asset name; the drawdown freeze blocks buys but not sells; a sell is a full exit; no shorting; max open positions, with exits freeing slots; the weekly cap across multiple buys in one run; cash shared across buys in one run; duplicates; `target_pct` of 0; a take-profit too close to the entry is dropped; a restored stop's whole shares and cent price.
   - **Agent:** research then submit (tool results feed stats; cache_control is present); the only tools are the three read-only ones; a nudge that recovers; a nudge that gives up; the research budget is enforced; malformed proposals; news tool output is labeled untrusted; invalid symbols are rejected.
   - **Briefing:** the return math, the sort order, and the freeze banner.
 - **Integration tests** (Postgres `trader_test`):
@@ -556,6 +562,7 @@ Everything runs in Docker; nothing uses the host's Python.
   - A full offline run writes every table.
   - A dry run submits nothing.
   - The kill switch holds orders back.
+  - A partially filled entry's stop is re-placed for its filled shares, leaving the symbol's other orders alone; a stop that can't be placed is logged and named.
   - A weekend date is skipped.
   - The unique index enforces one submit run per day, and `--force` only abandons a stale `running` row.
   - The live-money guard fires.
@@ -667,7 +674,7 @@ Build in this order, one branch and pull request per milestone. Post a short pla
 - The weekly new-position count includes entries that never filled.
 - Only daily closes are used. A stock that gaps up more than the entry buffer doesn't fill, and the entry is cancelled the next run.
 - On Mondays, the 24-hour news window misses Friday evening and the weekend.
-- A partially filled entry has no active stop until it fills completely, when Alpaca activates its legs. Cancelling it the next morning cancels the legs, leaving the filled shares with no stop, and paper trading partially fills eligible orders 10% of the time. The run warns and names the shares (section 8); how to protect them is decided before `submit` is switched on in M5.
+- A partially filled entry has no active stop until it fills completely, when Alpaca activates its legs, and paper trading partially fills eligible orders 10% of the time. Cancelling it the next morning cancels the legs, so the run re-places the stop for the filled shares (section 8); a take-profit isn't re-placed. If the stop can't be placed, the run logs an error and names the shares, which then need a stop placed by hand in Alpaca. Such an order isn't recorded in the database.
 
 ---
 

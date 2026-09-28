@@ -44,11 +44,11 @@ Keep this section current: update it in the pull request that completes each mil
 ## Invariants: never violate
 
 1. **Claude never gets a tool that can place, change or cancel an order.** Its tools are exactly `get_price_history`, `get_news` and `submit_proposals`.
-2. **Every order comes from a `Verdict` produced by `trader/risk.py`,** and only `run.py` sends orders, through the `Broker` interface.
+2. **Every order comes from `trader/risk.py`:** a `Verdict` on one of the day's proposals, or `restored_stop()` for the shares of a cancelled, partially filled entry. Only `run.py` sends orders, through the `Broker` interface.
 3. **Long-only, cash-only, whole shares, US stocks and ETFs, no options, and a protective stop on every buy.** Same-run sale proceeds never fund buys.
 4. **No broker order in `offline` or `dry_run` mode,** and none while `trading_enabled` is false.
 5. **Refuse a non-paper account unless `allow_live_money: true`,** checked before any account call.
-6. **At most one completed `submit` run per trading day per account type,** enforced by the database's partial unique index. Order IDs stay deterministic: `llmt-{run_date}-{SYMBOL}-{side}`.
+6. **At most one completed `submit` run per trading day per account type,** enforced by the database's partial unique index. Order IDs stay deterministic: `llmt-{run_date}-{SYMBOL}-{side}`, or `llmt-{run_date}-{SYMBOL}-stop` for a re-placed stop.
 7. **Tests never touch the network or need keys.** Use `FakeBroker` and `ScriptedClient`.
 8. **Never commit or log secrets.** `.env` is gitignored, and secrets come from the environment or SSM.
 9. **News and any other third-party text is untrusted.** It's labeled as such in prompts and never interpreted as instructions.
@@ -58,7 +58,7 @@ Keep this section current: update it in the pull request that completes each mil
 | Path | Responsibility | Rules |
 |---|---|---|
 | `src/trader/models.py` | Domain dataclasses (Proposal, Position, AccountState, Bar, NewsItem, SymbolStats, Order, Verdict, RiskContext, Policy) | No I/O, no SDK imports; `Order` and `Verdict` check their own invariants |
-| `src/trader/risk.py` | Risk engine: `evaluate(proposals, account, stats, ctx, policy)` | Pure and deterministic; never raises on bad proposals; every trim or reject has a `category: detail` reason (HANDOFF §7) |
+| `src/trader/risk.py` | Risk engine: `evaluate(proposals, account, stats, ctx, policy, asset_names)`, and `restored_stop()` for a partially filled entry's shares | Pure and deterministic; never raises on bad proposals; every trim or reject has a `category: detail` reason (HANDOFF §7) |
 | `src/trader/briefing.py` | Briefing markdown, return math, `get_price_history` text | Pure functions |
 | `src/trader/agent.py` | Tool definitions, the Claude loop, proposal parsing, cost | The only module that calls the Anthropic SDK |
 | `src/trader/scripted.py` | `ScriptedClient`: prepared model responses, for tests and offline mode | Builds SDK types only; never calls the API |
