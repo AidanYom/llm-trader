@@ -41,6 +41,7 @@ POLICY = Policy(
     drawdown_freeze_pct=15.0,
     drawdown_peak_since=None,
     blocked_symbols=frozenset({"TQQQ", "SQQQ", "SOXL"}),
+    blocked_name_patterns=(),
 )
 
 

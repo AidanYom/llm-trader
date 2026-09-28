@@ -808,9 +808,23 @@ drawdown_peak_since: null      # ISO date; ignore earlier equity history (set at
 blocked_symbols: [TQQQ, SQQQ, SOXL, SOXS, UVXY, SVXY, SPXL, SPXS, TSLL, NVDL, LABU, LABD, TNA, TZA, UPRO, SPXU]
 
 # Leveraged and inverse funds: a buy is rejected when its Alpaca asset name contains one of these as whole
-# words, ignoring case (section 7). Bare "Short" and "Ultra" would also match cash-like bond funds.
-blocked_name_patterns: [1X, 1.25X, 1.5X, 1.75X, 2X, 3X, Leveraged, Inverse, Bear, Direxion Daily,
-                        ProShares Ultra, ProShares UltraPro, ProShares UltraShort, ProShares Short]
+# words, ignoring case. Bare "Short" and "Ultra" would also match cash-like bond funds, so ProShares' funds
+# are caught by their "ProShares Ultra" and "ProShares Short" prefixes instead.
+blocked_name_patterns:
+  - 1X
+  - 1.25X
+  - 1.5X
+  - 1.75X
+  - 2X
+  - 3X
+  - Leveraged
+  - Inverse
+  - Bear
+  - Direxion Daily
+  - ProShares Ultra
+  - ProShares UltraPro
+  - ProShares UltraShort
+  - ProShares Short
 ```
 
 ### `config/strategy.yaml`

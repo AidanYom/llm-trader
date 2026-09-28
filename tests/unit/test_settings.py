@@ -127,6 +127,47 @@ def test_blocked_symbols_are_normalized(tmp_path: Path) -> None:
     assert policy.blocked_symbols == frozenset({"TQQQ", "SQQQ", "ON"})
 
 
+def name_patterns(tmp_path: Path, patterns: str) -> Path:
+    """The shipped policy.yaml with blocked_name_patterns, its last setting and a block list, replaced."""
+    text = SHIPPED_POLICY.read_text(encoding="utf-8")
+    head = text[: text.index("\nblocked_name_patterns:")]
+    path = tmp_path / "policy.yaml"
+    path.write_text(f"{head}\nblocked_name_patterns: {patterns}\n", encoding="utf-8")
+    return path
+
+
+def test_shipped_name_patterns_load() -> None:
+    patterns = load_policy(SHIPPED_POLICY).blocked_name_patterns
+
+    assert "3X" in patterns
+    assert "ProShares Ultra" in patterns
+
+
+def test_name_patterns_keep_their_order_with_whitespace_collapsed(tmp_path: Path) -> None:
+    policy = load_policy(name_patterns(tmp_path, "['3X', ' ProShares   Ultra ', Bear]"))
+
+    assert policy.blocked_name_patterns == ("3X", "ProShares Ultra", "Bear")
+
+
+def test_an_empty_list_of_name_patterns_checks_no_names(tmp_path: Path) -> None:
+    assert load_policy(name_patterns(tmp_path, "[]")).blocked_name_patterns == ()
+
+
+@pytest.mark.parametrize(
+    ("patterns", "message"),
+    [
+        ("Bear", "blocked_name_patterns: must be a list of words or phrases, got 'Bear'"),
+        ("[Bear, bear]", "blocked_name_patterns: bear is listed twice"),
+        ("[Bear, '--']", "blocked_name_patterns: '--' is not a word or phrase"),
+        ("[Bear, 3]", "blocked_name_patterns: 3 is not a word or phrase"),
+        ("[Bear, NO]", "False is not a word or phrase; YAML reads unquoted"),
+    ],
+)
+def test_unusable_name_patterns_are_named(tmp_path: Path, patterns: str, message: str) -> None:
+    with pytest.raises(ConfigError, match=re.escape(message)):
+        load_policy(name_patterns(tmp_path, patterns))
+
+
 def test_unreadable_or_empty_file_is_reported(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="can't read the file"):
         load_policy(tmp_path / "missing.yaml")
