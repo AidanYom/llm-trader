@@ -1,4 +1,4 @@
-"""The broker interface (HANDOFF §8), implemented by FakeBroker and, from M4, the Alpaca adapter.
+"""The broker interface (HANDOFF §8), implemented by AlpacaBroker (alpaca.py) and FakeBroker (fake.py).
 
 `Broker` is a `typing.Protocol`: an interface checked by shape, so an implementation needn't inherit from it.
 Only run.py sends orders through it (CLAUDE.md invariant 2).
