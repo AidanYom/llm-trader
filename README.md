@@ -79,6 +79,7 @@ Everything lands in the database. The run prints a one-screen summary. Logs are 
 - the calendar: today, the next sessions and the last completed one
 - 70 sessions of bars for SPY and XLK, and a bars request with a made-up ticker, which should be left out
 - the last 24 hours of market news, and SPY's news
+- the Alpaca names of every `blocked_symbols` ticker and of six cash-like bond funds, with the `blocked_name_patterns` pattern each matches: every blocked ticker should match one, and no bond fund should
 
 It exits 1 if any read failed. Warnings leave the exit code at 0.
 
