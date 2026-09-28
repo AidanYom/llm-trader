@@ -36,6 +36,7 @@ TOP_REJECTIONS = 5
 class EquityPoint:
     day: date
     equity: float
+    cash: float | None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -137,11 +138,24 @@ def gather(
 
 def equity_series(runs: Sequence[ReportRun]) -> list[EquityPoint]:
     """Completed runs' pre-market equity, one point per date: the day's last completed run with a snapshot."""
-    by_day: dict[date, float] = {}
+    by_day: dict[date, EquityPoint] = {}
     for run in runs:  # in start order, so a later run on the same date wins
         if run.status is RunStatus.COMPLETED and run.equity is not None:
-            by_day[run.run_date] = run.equity
-    return [EquityPoint(day=day, equity=equity) for day, equity in sorted(by_day.items())]
+            by_day[run.run_date] = EquityPoint(day=run.run_date, equity=run.equity, cash=run.cash)
+    return [by_day[day] for day in sorted(by_day)]
+
+
+def average_invested(series: Sequence[EquityPoint]) -> float | None:
+    """The mean share of equity invested (equity minus cash, over equity), where both are known.
+
+    Snapshot numbers are finite: repo.py stores a non-finite one as NULL, and such a run has no point.
+    """
+    shares = [
+        (point.equity - point.cash) / point.equity
+        for point in series
+        if point.cash is not None and point.equity > 0
+    ]
+    return sum(shares) / len(shares) if shares else None
 
 
 def baseline_return(
@@ -211,6 +225,12 @@ def _scorecard(data: ReportData) -> list[str]:
         lines.append(
             f"- Equity: {_usd(first.equity)} on {first.day.isoformat()} → {_usd(last.equity)} on "
             f"{last.day.isoformat()} ({_signed_pct(change)})"
+        )
+        invested = average_invested(series)
+        lines.append(
+            "- Average invested: n/a"
+            if invested is None
+            else f"- Average invested: {invested * 100:.1f}% of equity (the baseline is 100%)"
         )
         peak, drawdown = peak_and_worst_drawdown([point.equity for point in series])
         lines.append(f"- Peak equity {_usd(peak)}; worst drawdown in the window {drawdown * 100:.1f}%")

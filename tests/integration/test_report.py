@@ -63,6 +63,8 @@ def test_the_report_renders(engine: Engine, conn: Connection, tmp_path: Path) ->
     assert "| offline | 0 | 2 | 0 | 0 | 0 |" in text
     assert "- Proposals: 4 approved, 0 trimmed, 2 rejected; 2 malformed" in text
     assert "- Orders: 4 submitted, 0 not_submitted, 0 error" in text
+    invested = next(line for line in text.splitlines() if line.startswith("- Average invested: "))
+    assert invested.endswith("% of equity (the baseline is 100%)")
     assert "- Top rejection reasons: blocklist (2)" in text
     # The baseline reads the same fake closes the runs traded on.
     bars = offline_broker(TUESDAY).get_daily_bars(list(basket), 30)

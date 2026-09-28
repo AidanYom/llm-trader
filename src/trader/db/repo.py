@@ -447,6 +447,7 @@ class ReportRun:
     agent_submitted: bool | None
     cost_usd: float
     equity: float | None  # from the run's account snapshot; None without one, or when it was unknown
+    cash: float | None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -486,7 +487,7 @@ def report_runs(
     They come in start order, each with the equity of its account snapshot.
     """
     query = (
-        select(runs, account_snapshots.c.equity)
+        select(runs, account_snapshots.c.equity, account_snapshots.c.cash)
         .select_from(runs.outerjoin(account_snapshots))
         .where(
             runs.c.run_date.between(_day(first_day), _day(last_day)),
@@ -510,6 +511,7 @@ def report_runs(
             agent_submitted=_optional_bool(row.agent_submitted),
             cost_usd=_float(row.cost_usd),
             equity=_optional_float(row.equity),
+            cash=_optional_float(row.cash),
         )
         for row in conn.execute(query)
     ]

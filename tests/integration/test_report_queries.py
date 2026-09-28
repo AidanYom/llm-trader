@@ -58,7 +58,7 @@ def a_run(
     assert run_id is not None
     if equity is not None:
         repo.record_account_snapshot(
-            conn, run_id, AccountState(equity=equity, cash=equity), taken_at=started_at
+            conn, run_id, AccountState(equity=equity, cash=equity / 10), taken_at=started_at
         )
     finished_at = started_at + timedelta(minutes=2)
     if status is RunStatus.COMPLETED:
@@ -108,6 +108,7 @@ def test_report_runs_are_the_windows_runs_for_one_account_and_the_modes_asked(co
         agent_submitted=True,
         cost_usd=0.05,
         equity=10_000.0,
+        cash=1_000.0,
     )
     assert (found[1].status, found[1].error, found[1].cost_usd, found[1].equity) == (
         RunStatus.FAILED,
@@ -116,7 +117,7 @@ def test_report_runs_are_the_windows_runs_for_one_account_and_the_modes_asked(co
         None,
     )
     assert (found[2].status, found[2].skip_reason) == (RunStatus.SKIPPED, "market closed today")
-    assert found[3].equity == 10_100.5
+    assert (found[3].equity, found[3].cash) == (10_100.5, 1_010.05)
     offline = repo.report_runs(conn, **(WINDOW | {"modes": [RunMode.OFFLINE]}))
     assert [run.mode for run in offline] == [RunMode.OFFLINE]
 
