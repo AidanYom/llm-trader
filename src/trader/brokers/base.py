@@ -22,6 +22,9 @@ class BrokerError(RuntimeError):
 class CancelledOrder:
     broker_order_id: str
     symbol: str
+    # Shares the order had bought before it was cancelled. A cancelled entry's legs go with it, so these are
+    # left with no stop (HANDOFF §8 and §20).
+    filled_qty: float = 0.0
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

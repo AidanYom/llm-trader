@@ -38,6 +38,7 @@ class OpenOrder:
     broker_order_id: str
     symbol: str
     side: Side  # an unfilled entry is a buy; a position's stop and take-profit legs are sells
+    filled_qty: float = 0.0  # a partially filled entry's shares so far
 
 
 class FakeBroker:
@@ -104,7 +105,12 @@ class FakeBroker:
     def cancel_open_buy_orders(self) -> list[CancelledOrder]:
         self.calls.append("cancel_open_buy_orders")
         buys = self._cancel(lambda order: order.side == Side.BUY)
-        return [CancelledOrder(broker_order_id=order.broker_order_id, symbol=order.symbol) for order in buys]
+        return [
+            CancelledOrder(
+                broker_order_id=order.broker_order_id, symbol=order.symbol, filled_qty=order.filled_qty
+            )
+            for order in buys
+        ]
 
     def cancel_open_orders(self, symbol: str) -> list[str]:
         self.calls.append("cancel_open_orders")

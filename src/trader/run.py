@@ -25,7 +25,7 @@ from sqlalchemy import Connection, Engine
 
 from trader.agent import AgentResult, MalformedProposal, ModelClient, UsageMeter, run_agent
 from trader.briefing import build_briefing, symbol_stats
-from trader.brokers.base import Broker, BrokerError
+from trader.brokers.base import Broker, BrokerError, CancelledOrder
 from trader.brokers.fake import FakeBroker
 from trader.db import repo
 from trader.db.repo import NewRun
@@ -178,6 +178,7 @@ class _Run:
         self.meter = meter
         # Offline runs take the submit path against FakeBroker. The kill switch means no broker writes at all.
         self.writes_to_broker = run.mode in (RunMode.SUBMIT, RunMode.OFFLINE) and self.policy.trading_enabled
+        self.unprotected: list[CancelledOrder] = []  # partially filled entries cancelled with their stops
         strategy = self.strategy
         self.universe = list(
             dict.fromkeys((strategy.benchmark, *strategy.sector_etfs, *strategy.industry_etfs))
@@ -226,6 +227,7 @@ class _Run:
             verdicts=verdicts,
             malformed=agent.submission.malformed,
             orders=orders,
+            unprotected=self.unprotected,
         )
         log.info("run completed", extra={"run_id": self.run_id, "summary": summary})
         return RunResult(run_id=self.run_id, status=RunStatus.COMPLETED, summary=summary, briefing=briefing)
@@ -246,6 +248,19 @@ class _Run:
                     symbol=order.symbol,
                     reason=CancelReason.STALE_ENTRY,
                 )
+        # A partially filled entry's legs aren't active yet, and cancelling it cancels them: the shares it
+        # bought are left with no stop (HANDOFF §8 and §20).
+        self.unprotected = [order for order in cancelled if order.filled_qty > 0]
+        for order in self.unprotected:
+            log.warning(
+                "cancelled a partially filled entry, leaving its shares with no stop",
+                extra={
+                    "run_id": self.run_id,
+                    "symbol": order.symbol,
+                    "filled_qty": order.filled_qty,
+                    "broker_order_id": order.broker_order_id,
+                },
+            )
 
     def _read_account(self) -> AccountState:
         account = self.broker.get_account()
@@ -434,9 +449,10 @@ def format_summary(
     verdicts: Sequence[Verdict],
     malformed: Sequence[MalformedProposal],
     orders: Sequence[OrderLine],
+    unprotected: Sequence[CancelledOrder] = (),
 ) -> str:
     """The one-screen summary a run ends with (HANDOFF §9): date, mode, equity, cost, prompt version,
-    market view, then one line per verdict and per order."""
+    market view, then one line per verdict and per order, and shares a cancelled entry left with no stop."""
     lines = [
         f"{run.run_date.isoformat()} · {_mode(run)} · {status.value}",
         f"Equity {_usd(account.equity)} · cash {_usd(account.cash)} · prompt {run.prompt_version}",
@@ -458,6 +474,14 @@ def format_summary(
             for line in orders
         ),
     ]
+    if unprotected:
+        lines += [
+            "Shares with no stop, from partially filled entries cancelled with their stops:",
+            *(
+                f"  {order.symbol}: {order.filled_qty:g} shares (entry {order.broker_order_id})"
+                for order in unprotected
+            ),
+        ]
     return "\n".join(lines)
 
 
