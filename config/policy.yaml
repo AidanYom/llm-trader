@@ -1,8 +1,8 @@
 trading_enabled: true          # kill switch: false = research, evaluate and persist, but submit nothing
 allow_live_money: false        # must be true before the app runs against a non-paper Alpaca account
 
-max_position_pct: 8            # max % of equity in one symbol (existing holding included)
-max_open_positions: 6
+max_position_pct: 12           # max % of equity in one symbol (existing holding included)
+max_open_positions: 8
 max_new_positions_per_week: 4  # new symbols opened Mon–Sun; adding to a holding doesn't count
 min_cash_buffer_pct: 5         # never spend the last 5% of equity on buys
 
