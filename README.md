@@ -62,6 +62,27 @@ Everything lands in the database. The run prints a one-screen summary; logs are 
 - **`--show-briefing`** prints the briefing the model saw, before the summary.
 - **`--force`**, in submit mode, first abandons the day's `running` submit run, for example one left by a crash. It refuses if that run started less than 20 minutes ago, since it may still be going.
 - **Dry-run and submit** need the Alpaca adapter and the Claude client, which arrive in M4.
+
+## Weekly report
+
+`trader report [--days 7] [--no-baseline] [--offline]` (`make report`) writes a markdown review to `reports/week-YYYY-MM-DD.md` (HANDOFF §11). It covers the last `--days` New York dates, today included, and the dry-run and submit runs of the account type that `ALPACA_PAPER` names. It has four sections:
+
+- **Scorecard:**
+  - runs by mode and status
+  - equity and the worst drawdown
+  - API cost, failed runs included
+  - the return against an equal-weight sector-ETF baseline
+- **Behavior:**
+  - verdicts
+  - malformed proposals
+  - orders
+  - research calls
+  - prompt versions
+  - the top rejection reasons
+- **Current positions.**
+- **Daily log:** each proposal with its thesis, invalidation and verdict.
+
+`--offline` reports on offline runs instead, into a file ending `-offline.md`: `make report ARGS=--offline`. Until M4 adds the Alpaca adapter, a report on real runs shows the baseline as n/a.
 - **A run is refused or skipped when:**
   - the database isn't at the code's migration revision
   - the account is live and `allow_live_money` is false
