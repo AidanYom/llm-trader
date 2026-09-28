@@ -148,6 +148,8 @@ The app reads `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ANTHROPIC_API_KEY` and `DA
 
 `ALPACA_PAPER` must be `true` (the default when unset) or `false`. Anything else stops the app, so a typo can't point it at a live account.
 
+`ALPACA_DATA_FEED` must be `sip` (the default when unset) or `delayed_sip`: both give consolidated volume for history older than 15 minutes, which the liquidity limits assume. Other feeds, such as `iex`, stop the app.
+
 ## Database
 
 Postgres 16 records every run: its briefing, tool calls, proposals, verdicts, orders and cost (HANDOFF §10).

@@ -145,6 +145,26 @@ def alpaca_paper(environ: Mapping[str, str]) -> bool:
     raise ConfigError(f"ALPACA_PAPER must be true or false, got {value!r}")
 
 
+ALPACA_DATA_FEEDS = ("sip", "delayed_sip")
+
+
+def alpaca_data_feed(environ: Mapping[str, str]) -> str:
+    """ALPACA_DATA_FEED: sip when unset, or delayed_sip (HANDOFF §8).
+
+    Both give consolidated volume for history older than 15 minutes. Other feeds are refused: iex sees only a
+    few percent of the market's volume, so the liquidity floor would reject nearly every buy.
+    """
+    value = environ.get("ALPACA_DATA_FEED", "").strip().lower()
+    if value == "":
+        return "sip"
+    if value not in ALPACA_DATA_FEEDS:
+        raise ConfigError(
+            f"ALPACA_DATA_FEED must be sip or delayed_sip, got {value!r}: "
+            "the liquidity limits assume consolidated volume"
+        )
+    return value
+
+
 # A number's allowed range: the check, and how an error message describes it.
 _Range = tuple[Callable[[float], bool], str]
 _ABOVE_0: _Range = (lambda v: v > 0, "above 0")
