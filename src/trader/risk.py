@@ -4,6 +4,9 @@ Pure and deterministic, with no I/O. It never raises on bad input: a proposal wi
 field is rejected with a reason, and so is every buy when the account or risk context can't be sized
 against. Every trim and rejection carries a reason of the form "category: detail", and the weekly report
 groups rejections by the category, the text before the first colon.
+
+It builds every order run.py sends (CLAUDE.md invariant 2): those in the verdicts on the day's proposals,
+and, through `restored_stop()`, the stop for the shares of a cancelled, partially filled entry.
 """
 
 from __future__ import annotations
@@ -54,6 +57,20 @@ def evaluate(
     for i in sells + buys + invalid:  # the order matters: the engine tracks slots, cash and symbols seen
         verdicts[i] = engine.decide(proposals[i])
     return [verdicts[i] for i in range(len(proposals))]
+
+
+def restored_stop(symbol: str, filled_qty: float, stop_price: float | None) -> Order | None:
+    """The protective stop for the shares a cancelled, partially filled entry bought (HANDOFF §8).
+
+    The entry's legs only activate once it fills completely, and cancelling it cancels them, so its shares
+    would be left with no stop. This re-places the stop the engine approved for that entry, for the whole
+    shares it filled. None when there's nothing to place: no whole share, or no usable stop price.
+    """
+    qty = finite_float(filled_qty)
+    stop = to_cents(stop_price)
+    if qty is None or qty < 1 or stop is None or stop < 1:
+        return None
+    return Order(symbol=symbol, side=Side.SELL, qty=math.floor(qty), stop_price=stop / 100)
 
 
 def blocked_pattern(name: str, patterns: Sequence[str]) -> str | None:

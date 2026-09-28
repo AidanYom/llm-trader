@@ -62,7 +62,7 @@ Everything lands in the database. The run prints a one-screen summary. Logs are 
 
 - **Offline mode** (`make offline`) needs no keys. It runs the fixed scenario in `src/trader/offline.py`: a fake $10,000 account, a scripted model, a buy, an exit, a blocked buy and a malformed proposal, so every table gets a row. Its fake market is open every day.
 - **Dry-run mode** (`make dry-run`) runs against the Alpaca account `ALPACA_PAPER` names and against Claude, and records every order as `not_submitted`. It never changes the account, so each dry run starts from the account as it is, and dry runs never count toward the weekly new-position limit. It runs at any time of day, but only on trading days.
-- **Submit mode** (`make submit`) sends the approved orders to Alpaca, after cancelling earlier runs' unfilled entries. If one of those entries was partially filled, its shares are left with no stop; the summary lists them (HANDOFF §20).
+- **Submit mode** (`make submit`) sends the approved orders to Alpaca, after cancelling earlier runs' unfilled entries. Cancelling a partially filled entry cancels its stop too, so the run re-places that stop for the shares it bought, at the price the risk engine approved. If that fails, the run logs an error and the summary names the shares, which then need a stop placed by hand (HANDOFF §8).
 - **`--show-briefing`** prints the briefing the model saw, before the summary.
 - **`--force`**, in submit mode, first abandons the day's `running` submit run, for example one left by a crash. It refuses if that run started less than 20 minutes ago, since it may still be going.
 - **A run is refused or skipped when:**

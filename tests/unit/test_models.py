@@ -95,6 +95,13 @@ def test_valid_orders_build() -> None:
     assert buy_order(take_profit_price=None).take_profit_price is None
     assert buy_order(stop_price=50.49, take_profit_price=50.51).stop_price == 50.49
     assert Order(symbol="XLE", side=Side.SELL, qty=3).limit_price is None
+    assert Order(symbol="XLE", side=Side.SELL, qty=3, stop_price=0.01).stop_price == 0.01
+
+
+def test_only_a_sell_with_a_stop_price_is_a_stop_on_its_own() -> None:
+    assert Order(symbol="XLE", side=Side.SELL, qty=3, stop_price=46.1).is_stop
+    assert not Order(symbol="XLE", side=Side.SELL, qty=3).is_stop  # a full exit at market
+    assert not buy_order().is_stop  # its stop is a leg
 
 
 @pytest.mark.parametrize(
@@ -118,9 +125,16 @@ def test_invalid_buy_order_raises(changes: dict[str, Any]) -> None:
         buy_order(**changes)
 
 
-def test_sell_order_takes_no_prices() -> None:
-    with pytest.raises(ValueError, match="full exit at market"):
-        Order(symbol="XLE", side=Side.SELL, qty=3, limit_price=50.0)
+@pytest.mark.parametrize("changes", [{"limit_price": 50.0}, {"take_profit_price": 55.0}])
+def test_a_sell_takes_no_limit_or_take_profit(changes: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="full exit at market or a protective stop"):
+        Order(symbol="XLE", side=Side.SELL, qty=3, stop_price=46.1, **changes)
+
+
+@pytest.mark.parametrize("stop_price", [0.0, 0.004, -1.0, math.nan, math.inf])
+def test_a_stop_on_its_own_is_at_least_a_cent(stop_price: float) -> None:
+    with pytest.raises(ValueError, match="must be at least \\$0.01"):
+        Order(symbol="XLE", side=Side.SELL, qty=3, stop_price=stop_price)
 
 
 def test_verdict_has_an_order_exactly_when_not_rejected() -> None:
