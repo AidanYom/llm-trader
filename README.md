@@ -24,7 +24,7 @@ API keys are only needed for `make smoke`, `make dry-run` and `make submit`. For
 
 ## Make targets
 
-Each target is a single `docker compose` command. Targets for later milestones fail until that milestone lands.
+Each target is a single `docker compose` command. Targets for later milestones fail until that milestone lands. The targets that run the app (`offline`, `dry-run`, `submit`, `report`, `smoke`) pass `ARGS` on, for example `make offline ARGS=--show-briefing`.
 
 | Target | What it does | Raw command | Works from |
 |---|---|---|---|
@@ -39,13 +39,55 @@ Each target is a single `docker compose` command. Targets for later milestones f
 | `make lock` | Update `uv.lock` after editing dependencies | `docker compose run --rm --no-deps app uv lock` | M0 |
 | `make migrate` | Apply migrations to the dev database | `docker compose run --rm app alembic upgrade head` | M2 |
 | `make revision m="add x"` | Autogenerate a migration, then review it by hand | `docker compose run --rm app alembic revision --autogenerate -m "add x"` | M2 |
-| `make offline` | Full run with the fake broker and a scripted model | `docker compose run --rm app trader run --mode offline` | M3 |
-| `make report` | Weekly markdown report into `reports/` | `docker compose run --rm app trader report` | M3 |
-| `make smoke` | Read-only Alpaca check (needs keys) | `docker compose run --rm app trader smoke` | M4 |
-| `make dry-run` | Real Alpaca and Claude, no orders (needs keys) | `docker compose run --rm app trader run --mode dry-run` | M4 |
-| `make submit` | Real paper orders (needs keys) | `docker compose run --rm app trader run --mode submit` | M4 |
+| `make offline` | Full run with the fake broker and a scripted model | `docker compose run --rm app trader run --mode offline $(ARGS)` | M3 |
+| `make report` | Weekly markdown report into `reports/` | `docker compose run --rm app trader report $(ARGS)` | M3 |
+| `make smoke` | Read-only Alpaca check (needs keys) | `docker compose run --rm app trader smoke $(ARGS)` | M4 |
+| `make dry-run` | Real Alpaca and Claude, no orders (needs keys) | `docker compose run --rm app trader run --mode dry-run $(ARGS)` | M4 |
+| `make submit` | Real paper orders (needs keys) | `docker compose run --rm app trader run --mode submit $(ARGS)` | M4 |
 
 M5 adds `image`, `push`, `deploy` and `migrate-prod`.
+
+## Running a day
+
+`trader run --mode {offline,dry-run,submit}` runs the whole daily pipeline once (HANDOFF §3):
+
+1. It checks the guards, then reads the account.
+2. It builds the briefing and gives it to the model.
+3. The risk engine decides on the model's proposals.
+4. Approved orders go to the broker.
+
+Everything lands in the database. The run prints a one-screen summary; logs are JSON lines on stdout, at `LOG_LEVEL` (default `INFO`).
+
+- **Offline mode** (`make offline`) needs no keys. It runs the fixed scenario in `src/trader/offline.py`: a fake $10,000 account, a scripted model, a buy, an exit, a blocked buy and a malformed proposal, so every table gets a row. Its fake market is open every day.
+- **`--show-briefing`** prints the briefing the model saw, before the summary.
+- **`--force`**, in submit mode, first abandons the day's `running` submit run, for example one left by a crash. It refuses if that run started less than 20 minutes ago, since it may still be going.
+- **Dry-run and submit** need the Alpaca adapter and the Claude client, which arrive in M4.
+
+## Weekly report
+
+`trader report [--days 7] [--no-baseline] [--offline]` (`make report`) writes a markdown review to `reports/week-YYYY-MM-DD.md` (HANDOFF §11). It covers the last `--days` New York dates, today included, and the dry-run and submit runs of the account type that `ALPACA_PAPER` names. It has four sections:
+
+- **Scorecard:**
+  - runs by mode and status
+  - equity and the worst drawdown
+  - API cost, failed runs included
+  - the return against an equal-weight sector-ETF baseline
+- **Behavior:**
+  - verdicts
+  - malformed proposals
+  - orders
+  - research calls
+  - prompt versions
+  - the top rejection reasons
+- **Current positions.**
+- **Daily log:** each proposal with its thesis, invalidation and verdict.
+
+`--offline` reports on offline runs instead, into a file ending `-offline.md`: `make report ARGS=--offline`. Until M4 adds the Alpaca adapter, a report on real runs shows the baseline as n/a.
+- **A run is refused or skipped when:**
+  - the database isn't at the code's migration revision
+  - the account is live and `allow_live_money` is false
+  - the market is closed
+  - a submit run already completed that day
 
 ## Dependencies
 

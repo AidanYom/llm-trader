@@ -20,7 +20,7 @@ Keep this section current: update it in the pull request that completes each mil
 - [x] M0 Skeleton (Docker, Compose, Makefile, uv, ruff, pytest, CI)
 - [x] M1 Domain models and risk engine
 - [x] M2 Database: tables, Alembic, repository, integration tests
-- [ ] M3 Offline end to end: fake broker, briefing, agent loop, run, report, CLI
+- [x] M3 Offline end to end: fake broker, briefing, agent loop, run, report, CLI
 - [ ] M4 Real Alpaca and Anthropic locally (`make smoke`, `make dry-run`)
 - [ ] M5 Production: Lambda image, Terraform, Neon, deploy, alarm
 
@@ -65,6 +65,8 @@ Keep this section current: update it in the pull request that completes each mil
 | `src/trader/brokers/` | `Broker` protocol; `alpaca.py`; `fake.py` | The only place alpaca-py is imported |
 | `src/trader/db/` | `tables.py` (SQLAlchemy Core), `engine.py`, `repo.py` (explicit query functions) | No ORM; all SQL goes through `repo.py` |
 | `src/trader/run.py` | `run_daily()` orchestration, guards, persistence order, summary | The only module that sends orders |
+| `src/trader/offline.py` | The offline scenario: FakeBroker's account and the scripted conversation | Must keep writing a row to every table |
+| `src/trader/logs.py` | JSON log formatter and `configure_logging()` | Called once, by the CLI or the Lambda handler |
 | `src/trader/report.py` | Weekly markdown report | Read-only against the database |
 | `src/trader/settings.py` | Loads YAML config, assembles the prompt and `prompt_version`, resolves secrets | Config is loaded once and passed down, not read globally |
 | `src/trader/__main__.py` | argparse CLI: `run`, `report`, `smoke` | Thin; logic lives in the modules |
@@ -91,7 +93,7 @@ make revision m="add x"   # alembic autogenerate — review the file by hand
 make offline      # full run with FakeBroker + ScriptedClient
 make dry-run      # real Alpaca + Claude, no orders (needs .env keys)
 make submit       # real paper orders
-make report       # weekly markdown → reports/
+make report       # weekly markdown → reports/ (ARGS=--offline for offline runs)
 make smoke        # read-only Alpaca check
 ```
 

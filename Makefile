@@ -37,17 +37,18 @@ revision:
 	$(if $(m),,$(error usage: make revision m="describe the change"))
 	docker compose run --rm app alembic revision --autogenerate -m "$(m)"
 
+# These pass ARGS to the command, for example: make offline ARGS=--show-briefing
 offline:
-	docker compose run --rm app trader run --mode offline
+	docker compose run --rm app trader run --mode offline $(ARGS)
 
 dry-run:
-	docker compose run --rm app trader run --mode dry-run
+	docker compose run --rm app trader run --mode dry-run $(ARGS)
 
 submit:
-	docker compose run --rm app trader run --mode submit
+	docker compose run --rm app trader run --mode submit $(ARGS)
 
 report:
-	docker compose run --rm app trader report
+	docker compose run --rm app trader report $(ARGS)
 
 smoke:
-	docker compose run --rm app trader smoke
+	docker compose run --rm app trader smoke $(ARGS)
