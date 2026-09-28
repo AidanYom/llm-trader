@@ -139,6 +139,17 @@ def test_cancelling_stale_entries_leaves_the_legs() -> None:
     assert broker.cancel_open_buy_orders() == []
 
 
+def test_asset_names_are_made_up_unless_a_test_gives_them() -> None:
+    broker = FakeBroker(
+        now=MONDAY_PREMARKET, asset_names={"TECL": "Direxion Daily Technology Bull 3X Shares", "ZZZZ": None}
+    )
+
+    assert broker.get_asset_names(["XLE", "TECL", "ZZZZ"]) == {
+        "XLE": "XLE Fake Fund",
+        "TECL": "Direxion Daily Technology Bull 3X Shares",
+    }
+
+
 def test_a_cancelled_entry_reports_the_shares_it_had_bought() -> None:
     partial = OpenOrder(broker_order_id="o-1", symbol="IGV", side=Side.BUY, filled_qty=3)
     broker = FakeBroker(now=MONDAY_PREMARKET, open_orders=[partial])

@@ -21,9 +21,27 @@ from trader.models import (
     Verdict,
     VerdictStatus,
 )
-from trader.risk import drawdown_pct, evaluate, freeze_active
+from trader.risk import blocked_pattern, drawdown_pct, evaluate, freeze_active
 
 APPROVED, TRIMMED, REJECTED = VerdictStatus.APPROVED, VerdictStatus.TRIMMED, VerdictStatus.REJECTED
+
+# The patterns Aidan approved in M4, fixed here like the numbers below.
+PATTERNS = (
+    "1X",
+    "1.25X",
+    "1.5X",
+    "1.75X",
+    "2X",
+    "3X",
+    "Leveraged",
+    "Inverse",
+    "Bear",
+    "Direxion Daily",
+    "ProShares Ultra",
+    "ProShares UltraPro",
+    "ProShares UltraShort",
+    "ProShares Short",
+)
 
 # HANDOFF Appendix C's numbers, fixed here so tuning config/policy.yaml never changes these tests.
 POLICY = Policy(
@@ -41,6 +59,7 @@ POLICY = Policy(
     drawdown_freeze_pct=15.0,
     drawdown_peak_since=None,
     blocked_symbols=frozenset({"TQQQ", "SQQQ", "SOXL"}),
+    blocked_name_patterns=PATTERNS,
 )
 
 
@@ -97,13 +116,17 @@ def run(
     stats: Mapping[str, SymbolStats] = STATS,
     ctx: RiskContext | None = None,
     policy: Policy = POLICY,
+    names: Mapping[str, str] | None = None,  # None: a plain name for every proposed symbol
 ) -> list[Verdict]:
+    if names is None:
+        names = {symbol: f"{symbol} Fund" for symbol in (str(p.symbol).strip().upper() for p in proposals)}
     return evaluate(
         proposals,
         account() if acct is None else acct,
         stats,
         RiskContext() if ctx is None else ctx,
         policy,
+        names,
     )
 
 
@@ -226,6 +249,97 @@ def test_blocked_symbol_rejected() -> None:
 
 def test_buy_without_market_data_rejected() -> None:
     assert_rejected(only(run(buy("ZZZZ"))), "market data: no usable price history for ZZZZ")
+
+
+# --- Leveraged and inverse funds, by asset name (M4) ---
+
+LEVERAGED = "Direxion Daily Technology Bull 3X Shares"
+
+
+def test_a_leveraged_funds_name_blocks_the_buy() -> None:
+    verdict = only(run(buy("TECL"), stats={"TECL": stat("TECL")}, names={"TECL": LEVERAGED}))
+
+    assert_rejected(verdict, f'blocklist: TECL\'s name "{LEVERAGED}" matches the blocked pattern "3X"')
+
+
+def test_the_name_is_checked_before_market_data() -> None:
+    verdict = only(run(buy("TECL"), stats={}, names={"TECL": LEVERAGED}))
+
+    assert verdict.reasons[0].startswith("blocklist: TECL's name")
+
+
+def test_a_buy_without_an_asset_name_is_rejected() -> None:
+    verdict = only(run(buy("XLK"), names={}))
+
+    assert_rejected(verdict, "market data: no asset name for XLK, so it can't be checked for leverage")
+
+
+def test_missing_price_history_is_reported_before_a_missing_name() -> None:
+    assert_rejected(only(run(buy("ZZZZ"), names={})), "market data: no usable price history for ZZZZ")
+
+
+def test_a_sell_needs_no_asset_name() -> None:
+    assert only(run(sell("XLE"), acct=account(held("XLE")), names={})).status == APPROVED
+
+
+def test_no_patterns_check_no_names() -> None:
+    policy = replace(POLICY, blocked_name_patterns=())
+
+    verdict = only(run(buy("TECL"), stats={"TECL": stat("TECL")}, names={"TECL": LEVERAGED}, policy=policy))
+
+    assert verdict.status == APPROVED
+
+
+@pytest.mark.parametrize(
+    ("name", "pattern"),
+    [
+        ("ProShares UltraPro QQQ", "ProShares UltraPro"),
+        ("ProShares UltraPro Short QQQ", "ProShares UltraPro"),
+        ("ProShares Ultra QQQ", "ProShares Ultra"),
+        ("ProShares  Ultra   QQQ", "ProShares Ultra"),
+        ("ProShares UltraShort 20+ Year Treasury", "ProShares UltraShort"),
+        ("ProShares Short S&P500", "ProShares Short"),
+        ("ProShares Ultra VIX Short-Term Futures ETF", "ProShares Ultra"),
+        ("Direxion Daily Semiconductor Bull 3X Shares", "3X"),
+        ("Direxion Daily S&P 500 Bear 1X Shares", "1X"),
+        ("Direxion Daily Regional Banks Bull Shares", "Direxion Daily"),
+        ("GraniteShares 2x Long NVDA Daily ETF", "2X"),
+        ("GraniteShares 1.5x Long Coinbase Daily ETF", "1.5X"),
+        ("Volatility Shares -1x Short VIX Futures ETF", "1X"),
+        ("MicroSectors FANG+ Index -3X Inverse Leveraged ETN", "3X"),
+        ("T-Rex 2X Inverse Tesla Daily Target ETF", "2X"),
+        ("AdvisorShares Ranger Equity Bear ETF", "Bear"),
+        ("Some Fund Inverse", "Inverse"),
+    ],
+)
+def test_leveraged_and_inverse_names_match(name: str, pattern: str) -> None:
+    assert blocked_pattern(name, PATTERNS) == pattern
+
+
+def test_runs_of_whitespace_in_a_pattern_count_as_one_space() -> None:
+    assert blocked_pattern("ProShares Ultra QQQ", ["ProShares   Ultra"]) == "ProShares   Ultra"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "iShares Short Treasury Bond ETF",
+        "Vanguard Short-Term Bond ETF",
+        "JPMorgan Ultra-Short Income ETF",
+        "iShares Ultra Short-Term Bond Active ETF",
+        "Invesco Ultra Short Duration ETF",
+        "PGIM Ultra Short Bond ETF",
+        "Invesco DB US Dollar Index Bearish Fund",
+        "Energy Select Sector SPDR Fund",
+        "Global X Uranium ETF",
+        "SPDR S&P 500 ETF Trust",
+        "ProShares S&P 500 Dividend Aristocrats ETF",
+        "Direxion NASDAQ-100 Equal Weighted Index Shares",
+        "Invesco 12X Fund",  # 12X isn't 2X: a digit before it
+    ],
+)
+def test_plain_funds_names_dont_match(name: str) -> None:
+    assert blocked_pattern(name, PATTERNS) is None
 
 
 def test_drawdown_freeze_blocks_buys_not_sells() -> None:

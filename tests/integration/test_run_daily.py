@@ -60,6 +60,7 @@ POLICY = Policy(
     drawdown_freeze_pct=15.0,
     drawdown_peak_since=None,
     blocked_symbols=frozenset({"TQQQ", "SQQQ"}),
+    blocked_name_patterns=(),
 )
 CONFIG = replace(load_config(REPO_ROOT), policy=POLICY)
 
@@ -281,6 +282,45 @@ def test_cancelling_a_partially_filled_entry_warns_that_its_shares_have_no_stop(
     (warning,) = [record for record in caplog.records if record.levelname == "WARNING"]
     assert warning.getMessage() == "cancelled a partially filled entry, leaving its shares with no stop"
     assert (warning.__dict__["symbol"], warning.__dict__["filled_qty"]) == ("IGV", 3)
+
+
+def test_a_leveraged_fund_is_rejected_by_its_asset_name(engine: Engine, conn: Connection) -> None:
+    config = replace(CONFIG, policy=replace(POLICY, blocked_name_patterns=("3X",)))
+    broker = fake_broker(asset_names={"TECL": "Direxion Daily Technology Bull 3X Shares"})
+
+    result = run(
+        engine, research_then_submit(proposal("TECL"), proposal("URA")), broker=broker, config=config
+    )
+
+    assert (
+        '  buy TECL: rejected · blocklist: TECL\'s name "Direxion Daily Technology Bull 3X Shares" '
+        'matches the blocked pattern "3X"'
+    ) in result.summary.splitlines()
+    assert any(line.startswith("  buy URA: approved") for line in result.summary.splitlines())
+
+
+@pytest.mark.parametrize("symbol", ["URA", "CCJ"])  # an ETF from the briefing, and a stock it doesn't list
+def test_a_symbol_whose_bars_stopped_early_gets_no_stats(
+    symbol: str, engine: Engine, conn: Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    halted = FakeBroker(now=MONDAY).completed_sessions(symbol)[:-5]  # its last bar is a week old
+    broker = fake_broker(bars={symbol: halted})
+
+    result = run(engine, research_then_submit(proposal(symbol)), broker=broker)
+
+    assert f"  buy {symbol}: rejected · market data: no usable price history for {symbol}" in (
+        result.summary.splitlines()
+    )
+    (warning,) = [record for record in caplog.records if record.getMessage() == "dropped stale price history"]
+    assert (warning.__dict__["symbol"], warning.__dict__["as_of"]) == (symbol, halted[-1].day)
+
+
+def test_a_run_without_buys_looks_up_no_asset_names(engine: Engine, conn: Connection) -> None:
+    broker = fake_broker(open_orders=list(SMH_LEGS))
+
+    run(engine, research_then_submit(proposal("SMH", "sell")), broker=broker)
+
+    assert "get_asset_names" not in broker.calls
 
 
 def test_an_exit_cancels_its_legs_before_selling(engine: Engine, conn: Connection) -> None:

@@ -75,6 +75,13 @@ class Broker(Protocol):
     def get_news(self, symbols: Sequence[str] | None, since: datetime, limit: int) -> list[NewsItem]:
         """Up to `limit` stories from `since` on, newest first: about `symbols`, or about anything if None."""
 
+    def get_asset_names(self, symbols: Sequence[str]) -> dict[str, str]:
+        """Each asset's name as the broker lists it, such as "Energy Select Sector SPDR Fund".
+
+        The risk engine checks the names of proposed buys for leveraged and inverse funds (HANDOFF §7). A
+        symbol the broker doesn't know, or lists without a name, is left out.
+        """
+
     def cancel_open_buy_orders(self) -> list[CancelledOrder]:
         """Cancel every open BUY order: earlier runs' unfilled entries. An entry's legs go with it."""
 

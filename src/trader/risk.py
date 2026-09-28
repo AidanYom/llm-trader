@@ -8,7 +8,9 @@ groups rejections by the category, the text before the first colon.
 
 from __future__ import annotations
 
+import functools
 import math
+import re
 from collections.abc import Mapping, Sequence
 
 from trader.models import (
@@ -33,14 +35,18 @@ def evaluate(
     stats: Mapping[str, SymbolStats],
     ctx: RiskContext,
     policy: Policy,
+    asset_names: Mapping[str, str],
 ) -> list[Verdict]:
     """Decide every proposal, and return the verdicts in proposal order.
 
     Sells are evaluated before buys, so approved exits free position slots; each side keeps the proposals'
     order. The first proposal for a symbol in that evaluation order is the one evaluated, and later ones are
     rejected as duplicates, so a sell beats a buy for the same symbol.
+
+    `asset_names` holds the broker's name for each proposed buy's symbol, which is checked for leveraged and
+    inverse funds. A buy with no name is rejected, since it can't be checked.
     """
-    engine = _Engine(account, stats, ctx, policy)
+    engine = _Engine(account, stats, ctx, policy, asset_names)
     sells = [i for i, proposal in enumerate(proposals) if proposal.action == Side.SELL]
     buys = [i for i, proposal in enumerate(proposals) if proposal.action == Side.BUY]
     invalid = sorted(set(range(len(proposals))) - set(sells) - set(buys))
@@ -48,6 +54,23 @@ def evaluate(
     for i in sells + buys + invalid:  # the order matters: the engine tracks slots, cash and symbols seen
         verdicts[i] = engine.decide(proposals[i])
     return [verdicts[i] for i in range(len(proposals))]
+
+
+def blocked_pattern(name: str, patterns: Sequence[str]) -> str | None:
+    """The first pattern that appears in the asset name as whole words, ignoring case; None if none does.
+
+    Whole words: the characters just before and after the match aren't letters or digits, and runs of
+    whitespace count as one space. So "3X" matches "Bull 3X Shares" and "-3X", "ProShares Ultra" doesn't match
+    "ProShares UltraPro QQQ", and "Bear" doesn't match "Bearish".
+    """
+    text = " ".join(name.split())
+    return next((pattern for pattern in patterns if _whole_words(pattern).search(text)), None)
+
+
+@functools.cache
+def _whole_words(pattern: str) -> re.Pattern[str]:
+    words = re.escape(" ".join(pattern.split()))
+    return re.compile(rf"(?<![A-Za-z0-9]){words}(?![A-Za-z0-9])", re.IGNORECASE)
 
 
 def drawdown_pct(equity: float, equity_peak: float | None) -> float:
@@ -65,12 +88,18 @@ class _Engine:
     """Evaluates one run's proposals, tracking what earlier approvals in the run have used up."""
 
     def __init__(
-        self, account: AccountState, stats: Mapping[str, SymbolStats], ctx: RiskContext, policy: Policy
+        self,
+        account: AccountState,
+        stats: Mapping[str, SymbolStats],
+        ctx: RiskContext,
+        policy: Policy,
+        asset_names: Mapping[str, str],
     ) -> None:
         self.account = account
         self.stats = stats
         self.ctx = ctx
         self.policy = policy
+        self.asset_names = asset_names
         self.held = {_shown(position.symbol): position for position in account.positions}
         self.seen: set[str] = set()
         self.open_positions = len(account.positions)  # current − approved exits + approved new
@@ -132,16 +161,23 @@ class _Engine:
                 f"{_usd(_peak(equity, peak))} (freeze at {_pct(policy.drawdown_freeze_pct)})"
             )
 
-        # 2. Blocklist.
+        # 2. Blocklist: the symbol, then the asset name, which catches leveraged and inverse funds the symbol
+        # list can't name.
         if symbol in policy.blocked_symbols:
             return reject(f"blocklist: {symbol} is blocked")
+        name = self.asset_names.get(symbol)
+        pattern = None if name is None else blocked_pattern(name, policy.blocked_name_patterns)
+        if pattern is not None:
+            return reject(f'blocklist: {symbol}\'s name "{name}" matches the blocked pattern "{pattern}"')
 
-        # 3. Market data.
+        # 3. Market data: price history, and the asset name step 2 needs.
         stat = self.stats.get(symbol)
         last_close = finite_float(stat.last_close) if stat else None
         adv = finite_float(stat.avg_dollar_volume_20d) if stat else None
         if last_close is None or last_close <= 0 or adv is None or adv < 0:
             return reject(f"market data: no usable price history for {symbol}")
+        if name is None:
+            return reject(f"market data: no asset name for {symbol}, so it can't be checked for leverage")
 
         # 4. Price.
         if last_close < policy.min_price:

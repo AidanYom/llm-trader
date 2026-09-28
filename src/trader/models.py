@@ -277,6 +277,8 @@ class Policy:
     drawdown_freeze_pct: float
     drawdown_peak_since: date | None
     blocked_symbols: frozenset[str]  # uppercased
+    # Leveraged and inverse funds: words or phrases matched against a buy's asset name (HANDOFF §7 step 2).
+    blocked_name_patterns: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

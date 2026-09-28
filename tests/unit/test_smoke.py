@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -12,7 +13,8 @@ import pytest
 from trader.__main__ import main
 from trader.brokers.base import AccountSettings, BrokerError
 from trader.brokers.fake import FakeBroker
-from trader.models import AccountState
+from trader.models import AccountState, Policy
+from trader.settings import load_config
 from trader.smoke import SmokeBroker, SmokeReport, run_smoke
 
 NOW = datetime(2026, 9, 28, 13, 5, tzinfo=UTC)  # Monday, 09:05 in New York
@@ -29,11 +31,26 @@ SETTINGS = AccountSettings(
 )
 
 
+# Two blocked tickers and the patterns that catch them, fixed so tuning policy.yaml never changes these tests.
+POLICY = replace(
+    load_config(Path(__file__).resolve().parents[2]).policy,
+    blocked_symbols=frozenset({"TQQQ", "SOXL"}),
+    blocked_name_patterns=("3X", "ProShares UltraPro"),
+)
+NAMES: dict[str, str | None] = {
+    "TQQQ": "ProShares UltraPro QQQ",
+    "SOXL": "Direxion Daily Semiconductor Bull 3X Shares",
+    "SHV": "iShares Short Treasury Bond ETF",
+    "NOSUCHSYM": None,  # the fake makes up a name for any symbol; Alpaca doesn't
+}
+
+
 class SmokeFake(FakeBroker):
     """FakeBroker with the account settings AlpacaBroker reports. Its market is closed at weekends."""
 
     def __init__(self, settings: AccountSettings = SETTINGS, **kwargs: Any) -> None:
         kwargs.setdefault("bars", {"NOSUCHSYM": []})  # the fake makes up bars for any symbol; Alpaca doesn't
+        kwargs.setdefault("asset_names", NAMES)
         super().__init__(now=NOW, **kwargs)
         self.settings = settings
 
@@ -52,8 +69,8 @@ class UnknownCash(SmokeFake):
         return AccountState(equity=math.nan, cash=math.nan)
 
 
-def smoke(broker: SmokeBroker | None = None) -> SmokeReport:
-    return run_smoke(SmokeFake() if broker is None else broker, now=NOW, feed="sip")
+def smoke(broker: SmokeBroker | None = None, policy: Policy = POLICY) -> SmokeReport:
+    return run_smoke(SmokeFake() if broker is None else broker, now=NOW, feed="sip", policy=policy)
 
 
 def test_a_healthy_account_passes_with_every_check_ok() -> None:
@@ -168,7 +185,48 @@ def test_smoke_only_reads() -> None:
         "is_trading_day",
         "get_daily_bars",
         "get_news",
+        "get_asset_names",
     }
+
+
+def test_the_name_patterns_are_checked_against_real_names() -> None:
+    lines = smoke().text.splitlines()
+
+    assert (
+        "[ok]   asset names against blocked_name_patterns: "
+        "2 blocked tickers, 6 bond funds that must not match" in lines
+    )
+    assert '         SOXL "Direxion Daily Semiconductor Bull 3X Shares": matches "3X"' in lines
+    assert '         TQQQ "ProShares UltraPro QQQ": matches "ProShares UltraPro"' in lines
+    assert '         SHV "iShares Short Treasury Bond ETF": no match, as it should be' in lines
+
+
+def test_a_blocked_ticker_no_pattern_matches_is_a_warning() -> None:
+    report = smoke(policy=replace(POLICY, blocked_name_patterns=("3X",)))
+
+    lines = report.text.splitlines()
+    assert lines[-1] == "Smoke passed: 0 failures, 1 warning."
+    assert (
+        '         TQQQ "ProShares UltraPro QQQ": matches no pattern '
+        "(fine only if it isn't leveraged or inverse)"
+    ) in lines
+
+
+def test_a_bond_fund_a_pattern_matches_is_a_warning() -> None:
+    report = smoke(policy=replace(POLICY, blocked_name_patterns=("3X", "ProShares UltraPro", "Short")))
+
+    assert (
+        '         SHV "iShares Short Treasury Bond ETF": matches "Short", but it\'s a cash-like bond fund'
+        in (report.text.splitlines())
+    )
+    assert report.warnings == 1
+
+
+def test_a_name_for_the_made_up_ticker_is_a_warning() -> None:
+    report = smoke(SmokeFake(asset_names={**NAMES, "NOSUCHSYM": "Made-Up Fund"}))
+
+    assert '         NOSUCHSYM "Made-Up Fund": a made-up ticker has a name' in report.text.splitlines()
+    assert report.warnings == 1
 
 
 def test_trader_smoke_exits_0_when_every_read_works(

@@ -21,7 +21,7 @@ Keep this section current: update it in the pull request that completes each mil
 - [x] M1 Domain models and risk engine
 - [x] M2 Database: tables, Alembic, repository, integration tests
 - [x] M3 Offline end to end: fake broker, briefing, agent loop, run, report, CLI
-- [ ] M4 Real Alpaca and Anthropic locally (`make smoke`, `make dry-run`)
+- [x] M4 Real Alpaca and Anthropic locally (`make smoke`; Aidan dropped the planned dry runs)
 - [ ] M5 Production: Lambda image, Terraform, Neon, deploy, alarm
 
 ## How we work together

@@ -79,6 +79,7 @@ Everything lands in the database. The run prints a one-screen summary. Logs are 
 - the calendar: today, the next sessions and the last completed one
 - 70 sessions of bars for SPY and XLK, and a bars request with a made-up ticker, which should be left out
 - the last 24 hours of market news, and SPY's news
+- the Alpaca names of every `blocked_symbols` ticker and of six cash-like bond funds, with the `blocked_name_patterns` pattern each matches: every blocked ticker should match one, and no bond fund should
 
 It exits 1 if any read failed. Warnings leave the exit code at 0.
 
@@ -134,6 +135,7 @@ The values are Aidan's; the file holds the current ones, and its comments explai
 | `drawdown_freeze_pct` | When equity is this far below its peak, buys are rejected. Sells still go through. | risk engine |
 | `drawdown_peak_since` | A date: only equity from then on counts toward the peak. `null` uses all history. Set it at go-live or after a paper reset. | risk-context query |
 | `blocked_symbols` | Tickers that can never be bought. Quote any that YAML would read as true, false or null, such as `'ON'`. | risk engine |
+| `blocked_name_patterns` | Words or phrases that mark leveraged and inverse funds. A buy is rejected when its Alpaca asset name contains one as whole words, ignoring case: `3X` matches "Bull 3X Shares" but `Bear` doesn't match "Bearish". A buy whose name can't be looked up is rejected too. `make smoke` shows how the patterns match Alpaca's real names. | risk engine |
 
 ### `config/strategy.yaml`: the model, research budget and ETF universe
 

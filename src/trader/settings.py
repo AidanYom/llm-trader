@@ -207,6 +207,7 @@ def load_policy(path: Path) -> Policy:
         drawdown_freeze_pct=top.number("drawdown_freeze_pct", _PERCENT),
         drawdown_peak_since=top.optional_date("drawdown_peak_since"),
         blocked_symbols=top.symbols("blocked_symbols"),
+        blocked_name_patterns=top.phrases("blocked_name_patterns"),
     )
 
 
@@ -342,20 +343,35 @@ class _Section:
     def symbols(self, key: str) -> frozenset[str]:
         return frozenset(self._ticker(key, item) for item in self._list(key))
 
-    def _list(self, key: str) -> list[object]:
+    def phrases(self, key: str) -> tuple[str, ...]:
+        """An ordered list of words or phrases, each listed once ignoring case, with whitespace collapsed."""
+        phrases: list[str] = []
+        for item in self._list(key, "words or phrases"):
+            if not isinstance(item, str) or not any(character.isalnum() for character in item):
+                raise self.error(key, f"{item!r} is not a word or phrase{_yaml_hint(item)}")
+            phrase = " ".join(item.split())
+            if phrase.casefold() in {seen.casefold() for seen in phrases}:
+                raise self.error(key, f"{phrase} is listed twice")
+            phrases.append(phrase)
+        return tuple(phrases)
+
+    def _list(self, key: str, what: str = "tickers") -> list[object]:
         value = self._data[key]
         if not isinstance(value, list):
-            raise self.error(key, f"must be a list of tickers, got {value!r}")
+            raise self.error(key, f"must be a list of {what}, got {value!r}")
         return value
 
     def _ticker(self, key: str, item: object) -> str:
         symbol = normalize_symbol(item)
         if symbol is None:
-            hint = ""
-            if item is None or isinstance(item, bool):
-                hint = (
-                    "; YAML reads unquoted words such as ON, YES, NO and NULL as true, false or null, "
-                    "so quote them"
-                )
-            raise self.error(key, f"{item!r} is not a ticker{hint}")
+            raise self.error(key, f"{item!r} is not a ticker{_yaml_hint(item)}")
         return symbol
+
+
+def _yaml_hint(item: object) -> str:
+    """Why a list item might not be the string it looks like in the file."""
+    if item is None or isinstance(item, bool):
+        return (
+            "; YAML reads unquoted words such as ON, YES, NO and NULL as true, false or null, so quote them"
+        )
+    return ""

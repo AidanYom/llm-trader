@@ -142,7 +142,10 @@ def _report(args: argparse.Namespace) -> int:
 
 def _smoke() -> int:
     """Exit 1 if any read failed. Warnings, such as account settings to change, leave it at 0."""
-    report = run_smoke(_alpaca(Secrets(os.environ)), now=utc_now(), feed=alpaca_data_feed(os.environ))
+    policy = load_config(Path.cwd()).policy
+    report = run_smoke(
+        _alpaca(Secrets(os.environ)), now=utc_now(), feed=alpaca_data_feed(os.environ), policy=policy
+    )
     print(report.text)
     return 1 if report.failures else 0
 
