@@ -13,7 +13,7 @@ are made storable here (HANDOFF §10):
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -41,6 +41,7 @@ from trader.models import (
     CancelReason,
     Order,
     OrderStatus,
+    Position,
     Proposal,
     RiskContext,
     RunMode,
@@ -48,6 +49,7 @@ from trader.models import (
     Side,
     Usage,
     Verdict,
+    VerdictStatus,
     finite_float,
 )
 
@@ -427,6 +429,174 @@ def risk_context(conn: Connection, *, run_date: date, paper: bool, peak_since: d
     )
 
 
+# ---- The weekly report (HANDOFF §11) -----------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ReportRun:
+    run_id: UUID
+    run_date: date
+    started_at: datetime
+    mode: RunMode
+    status: RunStatus
+    skip_reason: str | None
+    error: str | None
+    model: str
+    prompt_version: str | None
+    market_view: str | None
+    agent_submitted: bool | None
+    cost_usd: float
+    equity: float | None  # from the run's account snapshot; None without one, or when it was unknown
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ReportProposal:
+    run_id: UUID
+    seq: int
+    symbol: str
+    action: Side
+    target_pct: float | None
+    stop_pct: float | None
+    thesis: str
+    invalidation: str
+    status: VerdictStatus
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ReportMalformed:
+    run_id: UUID
+    error: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ReportOrder:
+    run_id: UUID
+    symbol: str
+    side: Side
+    qty: int
+    status: OrderStatus
+
+
+def report_runs(
+    conn: Connection, *, first_day: date, last_day: date, paper: bool, modes: Collection[RunMode]
+) -> list[ReportRun]:
+    """Every run dated in the window for this account type and these modes, whatever its status.
+
+    They come in start order, each with the equity of its account snapshot.
+    """
+    query = (
+        select(runs, account_snapshots.c.equity)
+        .select_from(runs.outerjoin(account_snapshots))
+        .where(
+            runs.c.run_date.between(_day(first_day), _day(last_day)),
+            runs.c.paper == paper,
+            runs.c.mode.in_([RunMode(mode).value for mode in modes]),
+        )
+        .order_by(runs.c.started_at, runs.c.id)
+    )
+    return [
+        ReportRun(
+            run_id=_uuid(row.id),
+            run_date=_date(row.run_date),
+            started_at=_datetime(row.started_at),
+            mode=RunMode(row.mode),
+            status=RunStatus(row.status),
+            skip_reason=_optional_str(row.skip_reason),
+            error=_optional_str(row.error),
+            model=_str(row.model),
+            prompt_version=_optional_str(row.prompt_version),
+            market_view=_optional_str(row.market_view),
+            agent_submitted=_optional_bool(row.agent_submitted),
+            cost_usd=_float(row.cost_usd),
+            equity=_optional_float(row.equity),
+        )
+        for row in conn.execute(query)
+    ]
+
+
+def report_proposals(conn: Connection, run_ids: Sequence[UUID]) -> list[ReportProposal]:
+    """The runs' proposals with their verdicts, in each run's seq order."""
+    query = (
+        select(proposals, verdicts.c.status.label("verdict_status"), verdicts.c.reasons)
+        .join(verdicts)
+        .where(proposals.c.run_id.in_(run_ids))
+        .order_by(proposals.c.run_id, proposals.c.seq)
+    )
+    return [
+        ReportProposal(
+            run_id=_uuid(row.run_id),
+            seq=_int(row.seq),
+            symbol=_str(row.symbol),
+            action=Side(row.action),
+            target_pct=_optional_float(row.target_pct),
+            stop_pct=_optional_float(row.stop_pct),
+            thesis=_str(row.thesis),
+            invalidation=_str(row.invalidation),
+            status=VerdictStatus(row.verdict_status),
+            reasons=_strings(row.reasons),
+        )
+        for row in conn.execute(query)
+    ]
+
+
+def report_malformed(conn: Connection, run_ids: Sequence[UUID]) -> list[ReportMalformed]:
+    query = (
+        select(malformed_proposals.c.run_id, malformed_proposals.c.error)
+        .where(malformed_proposals.c.run_id.in_(run_ids))
+        .order_by(malformed_proposals.c.id)
+    )
+    return [ReportMalformed(run_id=_uuid(row.run_id), error=_str(row.error)) for row in conn.execute(query)]
+
+
+def report_orders(conn: Connection, run_ids: Sequence[UUID]) -> list[ReportOrder]:
+    query = (
+        select(orders.c.run_id, orders.c.symbol, orders.c.side, orders.c.qty, orders.c.status)
+        .where(orders.c.run_id.in_(run_ids))
+        .order_by(orders.c.id)
+    )
+    return [
+        ReportOrder(
+            run_id=_uuid(row.run_id),
+            symbol=_str(row.symbol),
+            side=Side(row.side),
+            qty=_int(row.qty),
+            status=OrderStatus(row.status),
+        )
+        for row in conn.execute(query)
+    ]
+
+
+def report_research_calls(conn: Connection, run_ids: Sequence[UUID]) -> dict[UUID, int]:
+    """Each run's research tool calls: every tool call but submit_proposals. Runs with none are left out."""
+    query = (
+        select(tool_calls.c.run_id, func.count())
+        .where(tool_calls.c.run_id.in_(run_ids), tool_calls.c.name != "submit_proposals")
+        .group_by(tool_calls.c.run_id)
+    )
+    return {_uuid(run_id): _int(calls) for run_id, calls in conn.execute(query)}
+
+
+def report_positions(conn: Connection, run_id: UUID) -> list[Position]:
+    """The positions a run's snapshot recorded, largest market value first. Unknown numbers are NaN."""
+    query = (
+        select(position_snapshots)
+        .where(position_snapshots.c.run_id == run_id)
+        .order_by(position_snapshots.c.market_value.desc().nulls_last(), position_snapshots.c.symbol)
+    )
+    return [
+        Position(
+            symbol=_str(row.symbol),
+            qty=_float_or_nan(row.qty),
+            avg_entry_price=_float_or_nan(row.avg_entry_price),
+            current_price=_float_or_nan(row.current_price),
+            market_value=_float_or_nan(row.market_value),
+            unrealized_plpc=_float_or_nan(row.unrealized_plpc),
+        )
+        for row in conn.execute(query)
+    ]
+
+
 # ---- Conversions at the database boundary ----------------------------------------------------------------
 
 
@@ -512,3 +682,53 @@ def _optional_float(value: object) -> float | None:
     if not isinstance(value, Decimal):
         raise TypeError(f"expected a NUMERIC value from the database, got {value!r}")
     return float(value)
+
+
+def _float(value: object) -> float:
+    number = _optional_float(value)
+    if number is None:
+        raise TypeError("expected a NUMERIC value from the database, got NULL")
+    return number
+
+
+def _float_or_nan(value: object) -> float:
+    """A nullable NUMERIC value, with NULL, meaning unknown, read back as NaN."""
+    number = _optional_float(value)
+    return math.nan if number is None else number
+
+
+def _str(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"expected text from the database, got {value!r}")
+    return value
+
+
+def _optional_str(value: object) -> str | None:
+    return None if value is None else _str(value)
+
+
+def _optional_bool(value: object) -> bool | None:
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise TypeError(f"expected a boolean from the database, got {value!r}")
+    return value
+
+
+def _strings(value: object) -> tuple[str, ...]:
+    """A JSONB array of strings, such as a verdict's reasons."""
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise TypeError(f"expected a JSON array of strings from the database, got {value!r}")
+    return tuple(value)
+
+
+def _date(value: object) -> date:
+    if isinstance(value, datetime) or not isinstance(value, date):
+        raise TypeError(f"expected a date from the database, got {value!r}")
+    return value
+
+
+def _datetime(value: object) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError(f"expected a timestamp from the database, got {value!r}")
+    return value
