@@ -41,7 +41,7 @@ Each target is a single `docker compose` command. Targets for later milestones f
 | `make revision m="add x"` | Autogenerate a migration, then review it by hand | `docker compose run --rm app alembic revision --autogenerate -m "add x"` | M2 |
 | `make offline` | Full run with the fake broker and a scripted model | `docker compose run --rm app trader run --mode offline $(ARGS)` | M3 |
 | `make report` | Weekly markdown report into `reports/` | `docker compose run --rm app trader report $(ARGS)` | M3 |
-| `make smoke` | Read-only Alpaca check (needs keys) | `docker compose run --rm app trader smoke $(ARGS)` | M4 |
+| `make smoke` | Read-only Alpaca check (needs keys) | `docker compose run --rm --no-deps app trader smoke $(ARGS)` | M4 |
 | `make dry-run` | Real Alpaca and Claude, no orders (needs keys) | `docker compose run --rm app trader run --mode dry-run $(ARGS)` | M4 |
 | `make submit` | Real paper orders (needs keys) | `docker compose run --rm app trader run --mode submit $(ARGS)` | M4 |
 

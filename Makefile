@@ -51,4 +51,4 @@ report:
 	docker compose run --rm app trader report $(ARGS)
 
 smoke:
-	docker compose run --rm app trader smoke $(ARGS)
+	docker compose run --rm --no-deps app trader smoke $(ARGS)

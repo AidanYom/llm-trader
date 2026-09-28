@@ -1,4 +1,4 @@
-"""The `trader` command (HANDOFF §12): `trader run` and `trader report`, and `trader smoke` from M4.
+"""The `trader` command (HANDOFF §12): `trader run`, `trader report` and `trader smoke`.
 
 argparse, Python's standard command-line parser, reads the arguments. This module only wires config,
 secrets, the database, a broker and a model client together, and prints what comes back; the logic lives
@@ -12,6 +12,7 @@ import os
 import sys
 from pathlib import Path
 
+from trader.brokers.alpaca import AlpacaBroker
 from trader.db.engine import DatabaseUrlError, make_engine
 from trader.db.repo import SchemaVersionError
 from trader.logs import configure_logging
@@ -19,7 +20,15 @@ from trader.models import RunMode, new_york_date
 from trader.offline import offline_broker, offline_client
 from trader.report import write_report
 from trader.run import ForceRefusedError, LiveMoneyError, run_daily, utc_now
-from trader.settings import ConfigError, SecretError, Secrets, alpaca_paper, load_config
+from trader.settings import (
+    ConfigError,
+    SecretError,
+    Secrets,
+    alpaca_data_feed,
+    alpaca_paper,
+    load_config,
+)
+from trader.smoke import run_smoke
 
 # Errors a user can fix. They're printed as one line; anything else keeps its traceback.
 USER_ERRORS = (
@@ -65,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument(
         "--offline", action="store_true", help="report on offline runs instead of dry-run and submit runs"
     )
+    commands.add_parser(
+        "smoke",
+        help="read-only checks of the Alpaca account and market data",
+        description="Read the Alpaca account, its configuration, the calendar, bars and news, and report "
+        "what came back (HANDOFF §8). It never places or cancels an order. Needs the Alpaca keys.",
+    )
     return parser
 
 
@@ -72,7 +87,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
-        return _report(args) if args.command == "report" else _run(args)
+        if args.command == "report":
+            return _report(args)
+        if args.command == "smoke":
+            return _smoke()
+        return _run(args)
     except USER_ERRORS as exc:
         print(f"trader: {exc}", file=sys.stderr)
         return 1
@@ -111,6 +130,23 @@ def _report(args: argparse.Namespace) -> int:
         engine.dispose()
     print(f"Wrote {path}")
     return 0
+
+
+def _smoke() -> int:
+    """Exit 1 if any read failed. Warnings, such as account settings to change, leave it at 0."""
+    report = run_smoke(_alpaca(Secrets(os.environ)), now=utc_now(), feed=alpaca_data_feed(os.environ))
+    print(report.text)
+    return 1 if report.failures else 0
+
+
+def _alpaca(secrets: Secrets) -> AlpacaBroker:
+    """The Alpaca account that ALPACA_PAPER names. Building it makes no network call."""
+    return AlpacaBroker.connect(
+        api_key=secrets.get("ALPACA_API_KEY"),
+        secret_key=secrets.get("ALPACA_SECRET_KEY"),
+        paper=alpaca_paper(os.environ),
+        feed=alpaca_data_feed(os.environ),
+    )
 
 
 def _run(args: argparse.Namespace) -> int:
