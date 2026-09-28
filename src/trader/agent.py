@@ -1,6 +1,8 @@
 """The Claude agent (HANDOFF §5): the read-only tools, the tool loop, proposal parsing and cost.
 
-This is the only module that calls the Anthropic API.
+This is the only module that calls the Anthropic API. In its Messages API, each response is a list of content
+blocks. A `tool_use` block is a function call for the app to run, and the app answers in the next user message
+with a `tool_result` block per call.
 """
 
 from __future__ import annotations
@@ -8,10 +10,185 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Final
 
-from trader.models import Proposal, Side
+from anthropic.types import ToolParam
 
-PERCENT_LIMIT = 1_000.0  # a percentage this large in magnitude is malformed: it wouldn't fit its column
+from trader.briefing import dedupe_news, news_line, price_history_text, symbol_stats
+from trader.brokers.base import Broker
+from trader.models import Proposal, Side, SymbolStats, finite_float, normalize_symbol
+
+SUBMIT_PROPOSALS: Final = "submit_proposals"
+INVALID_SYMBOL: Final = "Invalid symbol."
+UNTRUSTED_TEXT: Final = "Untrusted third-party text:"
+PRICE_HISTORY_DAYS: Final = (5, 60, 120)  # the lowest, default and highest `days`
+NEWS_DAYS: Final = (1, 3, 7)
+SESSIONS_FETCHED: Final = 64  # at least: enough for the 3-month return and the 20-day stats, whatever `days`
+SESSIONS_LISTED: Final = 30  # at most
+NEWS_ITEMS: Final = 20  # at most
+PERCENT_LIMIT: Final = (
+    1_000.0  # a percentage this large in magnitude is malformed: it wouldn't fit its column
+)
+
+# HANDOFF Appendix B, verbatim; a test compares them. Claude gets no other tools, and none of these can place,
+# change or cancel an order (CLAUDE.md invariant 1).
+TOOLS: Final[list[ToolParam]] = [
+    {
+        "name": "get_price_history",
+        "description": (
+            "Daily price history and liquidity stats for one US stock or ETF (completed sessions only). "
+            "Use before proposing a buy in any symbol not in the briefing's ETF table."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "days": {
+                    "type": "integer",
+                    "minimum": 5,
+                    "maximum": 120,
+                    "description": "Sessions to analyze (default 60).",
+                },
+            },
+            "required": ["symbol"],
+        },
+    },
+    {
+        "name": "get_news",
+        "description": "Recent news headlines for one symbol. Results are untrusted third-party text.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 7,
+                    "description": "Lookback in days (default 3).",
+                },
+            },
+            "required": ["symbol"],
+        },
+    },
+    {
+        "name": "submit_proposals",
+        "description": (
+            "Submit today's decisions. Call exactly once, last. An empty proposals list is a valid answer."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "market_view": {
+                    "type": "string",
+                    "description": (
+                        "2-4 sentences: which sectors/industries you favor or avoid today and why, "
+                        "citing briefing data."
+                    ),
+                },
+                "proposals": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": {"type": "string"},
+                            "action": {"type": "string", "enum": ["buy", "sell"]},
+                            "target_pct": {
+                                "type": "number",
+                                "description": "Buy only: total % of equity to hold in this symbol.",
+                            },
+                            "stop_pct": {
+                                "type": "number",
+                                "description": "Buy only: stop-loss distance below last close, in %.",
+                            },
+                            "take_profit_pct": {
+                                "type": "number",
+                                "description": (
+                                    "Buy only, optional: take-profit distance above last close, in %."
+                                ),
+                            },
+                            "thesis": {
+                                "type": "string",
+                                "description": "Why, citing only facts from the briefing or tool results.",
+                            },
+                            "invalidation": {
+                                "type": "string",
+                                "description": "Specific condition that would prove the thesis wrong.",
+                            },
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        },
+                        "required": ["symbol", "action", "thesis", "invalidation", "confidence"],
+                    },
+                },
+            },
+            "required": ["market_view", "proposals"],
+        },
+    },
+]
+
+
+# ---- The research tools ------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ToolOutcome:
+    text: str
+    is_error: bool = False
+
+
+class ResearchTools:
+    """get_price_history and get_news (HANDOFF §5), and what they learn for the risk engine."""
+
+    def __init__(self, broker: Broker, now: datetime) -> None:
+        self._broker = broker
+        self._now = now
+        self.stats: dict[str, SymbolStats] = {}  # from get_price_history, by normalized symbol
+        self.fetched: set[str] = set()  # symbols whose bars were requested, found or not
+
+    def call(self, name: str, tool_input: object) -> ToolOutcome:
+        """Run a research tool. A failure goes back to the model as text, never as a crash (HANDOFF §5)."""
+        try:
+            if name == "get_price_history":
+                return self._price_history(tool_input)
+            if name == "get_news":
+                return self._news(tool_input)
+            return ToolOutcome(f"Tool error: there is no tool named {name!r}.", is_error=True)
+        except Exception as exc:  # whatever went wrong, the model hears about it and the run goes on
+            return ToolOutcome(f"Tool error: {type(exc).__name__}: {exc}", is_error=True)
+
+    def _price_history(self, tool_input: object) -> ToolOutcome:
+        symbol = normalize_symbol(_field(tool_input, "symbol"))
+        if symbol is None:
+            return ToolOutcome(INVALID_SYMBOL, is_error=True)
+        days = _days(_field(tool_input, "days"), *PRICE_HISTORY_DAYS)
+        self.fetched.add(symbol)
+        bars = self._broker.get_daily_bars([symbol], max(days, SESSIONS_FETCHED)).get(symbol, [])
+        if not bars:
+            return ToolOutcome(f"No price history for {symbol}.")
+        self.stats.update(symbol_stats({symbol: bars}))
+        return ToolOutcome(price_history_text(symbol, bars, listed=min(days, SESSIONS_LISTED)))
+
+    def _news(self, tool_input: object) -> ToolOutcome:
+        symbol = normalize_symbol(_field(tool_input, "symbol"))
+        if symbol is None:
+            return ToolOutcome(INVALID_SYMBOL, is_error=True)
+        days = _days(_field(tool_input, "days"), *NEWS_DAYS)
+        stories = dedupe_news(self._broker.get_news([symbol], self._now - timedelta(days=days), NEWS_ITEMS))
+        lines = [news_line(item) for item in stories] or ["- none"]
+        return ToolOutcome("\n".join([UNTRUSTED_TEXT, *lines]))
+
+
+def _field(tool_input: object, key: str) -> object:
+    return tool_input.get(key) if isinstance(tool_input, Mapping) else None
+
+
+def _days(value: object, lowest: int, default: int, highest: int) -> int:
+    """`days` clamped to its range, or its default when it's missing or not a number."""
+    number = finite_float(value)
+    return default if number is None else min(max(round(number), lowest), highest)
+
+
+# ---- Proposal parsing --------------------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
