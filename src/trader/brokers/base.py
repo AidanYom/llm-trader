@@ -25,6 +25,24 @@ class CancelledOrder:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class AccountSettings:
+    """The Alpaca account's own settings, which `trader smoke` checks (HANDOFF §8). Not part of Broker.
+
+    Aidan sets them in Alpaca; the app never changes them.
+    """
+
+    status: str  # ACTIVE when the account can trade
+    trading_blocked: bool
+    account_blocked: bool
+    trade_suspended_by_user: bool
+    suspend_trade: bool  # the configuration's switch for the same thing
+    buying_power: float
+    no_shorting: bool
+    max_margin_multiplier: float
+    max_options_trading_level: int | None  # None when Alpaca leaves it unset
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SubmittedOrder:
     """The broker's receipt for an order it accepted."""
 
