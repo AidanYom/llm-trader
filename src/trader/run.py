@@ -306,13 +306,28 @@ class _Run:
         return briefing, bars
 
     def _stats(self, bars: Mapping[str, Sequence[Bar]], agent: AgentResult) -> dict[str, SymbolStats]:
-        """The risk engine's market data: the briefing's ETFs, the model's research, then any other buys."""
-        stats = symbol_stats(bars) | agent.stats
+        """The risk engine's market data: the briefing's ETFs, the model's research, then any other buys.
+
+        A symbol whose last bar is older than the latest session in the briefing's bars, such as a halted
+        or delisted stock, gets no stats, so the engine rejects buying it instead of sizing it on an old close
+        (HANDOFF §7 step 3). Every ETF in the briefing trades every session, so that's the last completed one.
+        """
+        universe = symbol_stats(bars)
+        stats = universe | agent.stats
         seen = {*self.universe, *agent.researched}
         unseen = [symbol for symbol in _proposed_buys(agent) if symbol not in seen]
         if unseen:
             stats |= symbol_stats(self.broker.get_daily_bars(unseen, BUY_SESSIONS))
-        return stats
+        if not universe:
+            return stats
+        last_session = max(stat.as_of for stat in universe.values())
+        for stat in stats.values():
+            if stat.as_of < last_session:
+                log.warning(
+                    "dropped stale price history",
+                    extra={"symbol": stat.symbol, "as_of": stat.as_of, "last_session": last_session},
+                )
+        return {symbol: stat for symbol, stat in stats.items() if stat.as_of >= last_session}
 
     def _record_decisions(self, agent: AgentResult, verdicts: Sequence[Verdict]) -> list[int]:
         with self.engine.begin() as conn:
