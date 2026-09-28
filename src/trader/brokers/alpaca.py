@@ -11,6 +11,7 @@ alpaca-py's own signatures: the real clients satisfy them, and tests pass fakes.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -44,6 +45,7 @@ RawData = dict[str, Any]
 BARS_DELAY = timedelta(minutes=20)  # the free data plan serves SIP history only once it's 15 minutes old
 FEEDS = {"sip": DataFeed.SIP, "delayed_sip": DataFeed.DELAYED_SIP}  # settings.alpaca_data_feed()'s values
 MAX_ERROR_TEXT = 300  # characters of an API error's body kept in BrokerError's message
+REQUEST_TIMEOUT = (10.0, 30.0)  # seconds to connect, and to wait for a response, on every Alpaca request
 
 
 class TradingApi(Protocol):
@@ -68,6 +70,24 @@ class NewsApi(Protocol):
     """The method AlpacaBroker calls on alpaca-py's NewsClient, which it builds to return raw JSON."""
 
     def get_news(self, request_params: NewsRequest, /) -> NewsSet | RawData: ...
+
+
+def real_clients(
+    api_key: str, secret_key: str, *, paper: bool
+) -> tuple[TradingClient, StockHistoricalDataClient, NewsClient]:
+    """alpaca-py's trading, bars and news clients, each with REQUEST_TIMEOUT on every request."""
+    clients = (
+        TradingClient(api_key, secret_key, paper=paper),
+        StockHistoricalDataClient(api_key, secret_key),
+        NewsClient(api_key, secret_key, raw_data=True),
+    )
+    for client in clients:
+        # alpaca-py sends requests with no timeout, so a stalled connection would hang the run (HANDOFF §8).
+        # `_session` is the requests.Session behind each alpaca-py client. It isn't public, so a test pins it.
+        session = client._session
+        # Replacing the method on this one session object is the point: alpaca-py has no timeout setting.
+        session.request = functools.partial(session.request, timeout=REQUEST_TIMEOUT)  # type: ignore[method-assign]
+    return clients
 
 
 def _utc_now() -> datetime:
@@ -99,13 +119,8 @@ class AlpacaBroker:
     @classmethod
     def connect(cls, *, api_key: str, secret_key: str, paper: bool, feed: str) -> AlpacaBroker:
         """AlpacaBroker on alpaca-py's real clients. Building them makes no network call."""
-        return cls(
-            trading=TradingClient(api_key, secret_key, paper=paper),
-            bars=StockHistoricalDataClient(api_key, secret_key),
-            news=NewsClient(api_key, secret_key, raw_data=True),
-            paper=paper,
-            feed=feed,
-        )
+        trading, bars, news = real_clients(api_key, secret_key, paper=paper)
+        return cls(trading=trading, bars=bars, news=news, paper=paper, feed=feed)
 
     # ---- Broker: reads -------------------------------------------------------------------------------------
 

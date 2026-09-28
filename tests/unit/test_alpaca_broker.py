@@ -7,6 +7,7 @@ the real clients fit where the fakes go. Nothing here patches alpaca-py or reque
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import math
@@ -30,7 +31,15 @@ from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.requests import GetCalendarRequest
 from pydantic import ValidationError
 
-from trader.brokers.alpaca import AlpacaBroker, BarsApi, NewsApi, TradingApi, account_state
+from trader.brokers.alpaca import (
+    REQUEST_TIMEOUT,
+    AlpacaBroker,
+    BarsApi,
+    NewsApi,
+    TradingApi,
+    account_state,
+    real_clients,
+)
 from trader.brokers.base import AccountSettings, BrokerError
 from trader.models import NEW_YORK, Bar, NewsItem, Position
 
@@ -250,6 +259,15 @@ def test_connect_keeps_the_paper_flag_for_the_live_money_guard(paper: bool) -> N
 def test_a_feed_without_consolidated_volume_is_refused() -> None:
     with pytest.raises(ValueError, match="unsupported data feed 'iex'"):
         broker(feed="iex")
+
+
+def test_every_alpaca_request_gets_a_timeout() -> None:
+    # alpaca-py sets none. The timeout rides on each client's requests.Session, which alpaca-py keeps private,
+    # so this test notices if an upgrade moves it.
+    for client in real_clients("key-not-real", "secret-not-real", paper=True):
+        request = client._session.request
+        assert isinstance(request, functools.partial)
+        assert request.keywords == {"timeout": REQUEST_TIMEOUT}
 
 
 # ---- Calendar and account ----------------------------------------------------------------------------------
