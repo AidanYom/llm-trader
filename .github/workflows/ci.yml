@@ -62,5 +62,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # --provenance=false: Lambda refuses the image index Docker's default provenance attestation creates.
       - name: Build the Lambda image (no push)
-        run: docker build --platform linux/amd64 --target lambda .
+        run: docker build --platform linux/amd64 --provenance=false --sbom=false --target lambda -t llm-trader:ci .
+      - name: Check the image imports the handler and loads its config (no network)
+        run: docker run --rm -i --network none --entrypoint python llm-trader:ci - < docker/lambda_check.py
