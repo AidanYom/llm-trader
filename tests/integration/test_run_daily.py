@@ -6,9 +6,10 @@ through `conn`, whose fixture empties every table before the test.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,7 +17,7 @@ import pytest
 from anthropic.types import Message
 from sqlalchemy import Connection, Engine, Table, func, select, text
 
-from trader.brokers.base import BrokerError, SubmittedOrder
+from trader.brokers.base import BrokerError, CancelledOrder, SubmittedOrder
 from trader.brokers.fake import FakeBroker, Holding, OpenOrder
 from trader.db import repo
 from trader.db.repo import NewRun, SchemaVersionError
@@ -41,6 +42,7 @@ from trader.settings import Config, load_config
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MONDAY = datetime(2026, 9, 28, 12, 31, tzinfo=UTC)  # 08:31 in New York
+TUESDAY = MONDAY + timedelta(days=1)
 SATURDAY = datetime(2026, 10, 3, 12, 31, tzinfo=UTC)
 RUN_DATE = date(2026, 9, 28)
 
@@ -267,21 +269,132 @@ def test_stale_entries_are_cancelled_before_the_account_is_read(engine: Engine, 
     assert broker.open_orders == list(SMH_LEGS)  # the legs of a held position stay
 
 
-def test_cancelling_a_partially_filled_entry_warns_that_its_shares_have_no_stop(
+# ---- A partially filled entry's stop, re-placed (HANDOFF §8) -----------------------------------------------
+
+
+def monday_entry(engine: Engine, conn: Connection) -> Any:  # a Row, read by column name
+    """Monday's run buys URA. By Tuesday's run, 3 of its shares have filled and the rest are still open."""
+    run(engine, research_then_submit(proposal("URA")))
+    query = select(orders.c.broker_order_id, orders.c.proposal_id, orders.c.stop_price).where(
+        orders.c.client_order_id == "llmt-2026-09-28-URA-buy"
+    )
+    return conn.execute(query).one()
+
+
+def tuesday_broker(entry: Any, cls: Callable[..., FakeBroker] = FakeBroker, **changes: Any) -> Any:
+    partial_fill = OpenOrder(broker_order_id=entry.broker_order_id, symbol="URA", side=Side.BUY, filled_qty=3)
+    settings: dict[str, Any] = {
+        "holdings": [Holding(symbol="URA", qty=3, avg_entry_price=40.0)],
+        "open_orders": [partial_fill],
+    }
+    return cls(now=TUESDAY, **(settings | changes))
+
+
+def stop_rows(conn: Connection) -> list[tuple[Any, ...]]:
+    query = select(
+        orders.c.client_order_id,
+        orders.c.side,
+        orders.c.qty,
+        orders.c.stop_price,
+        orders.c.limit_price,
+        orders.c.proposal_id,
+        orders.c.opens_new_position,
+        orders.c.status,
+    ).where(orders.c.client_order_id.like("%-stop"))
+    return [tuple(row) for row in conn.execute(query)]
+
+
+def test_a_partially_filled_entry_gets_its_stop_back_for_the_shares_it_bought(
     engine: Engine, conn: Connection, caplog: pytest.LogCaptureFixture
 ) -> None:
-    partial = replace(STALE_ENTRY, filled_qty=3)
-    broker = fake_broker(open_orders=[*SMH_LEGS, partial])
+    entry = monday_entry(engine, conn)
+    broker = tuesday_broker(entry)
+
+    result = run(engine, research_then_submit(), broker=broker, now=TUESDAY)
+
+    stop = Order(symbol="URA", side=Side.SELL, qty=3, stop_price=float(entry.stop_price))
+    assert broker.submitted == [(stop, "llmt-2026-09-29-URA-stop")]
+    assert stop_rows(conn) == [
+        ("llmt-2026-09-29-URA-stop", "sell", 3, entry.stop_price, None, entry.proposal_id, False, "submitted")
+    ]
+    assert f"  stop 3 URA at ${entry.stop_price}: submitted (fake-1, accepted)" in result.summary.splitlines()
+    assert "Shares with no stop" not in result.summary
+    (warning,) = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert warning.getMessage() == "cancelled a partially filled entry, and its stop with it"
+    assert (warning.__dict__["symbol"], warning.__dict__["filled_qty"]) == ("URA", 3)
+    assert not [record for record in caplog.records if record.levelname == "ERROR"]
+
+
+def test_re_placing_a_stop_leaves_the_symbols_other_orders_alone(engine: Engine, conn: Connection) -> None:
+    """Topping up a holding: the older shares keep their own stop, which the new one mustn't cancel."""
+    entry = monday_entry(engine, conn)
+    older_stop = OpenOrder(broker_order_id="ura-stop", symbol="URA", side=Side.SELL)
+    partial_fill = OpenOrder(broker_order_id=entry.broker_order_id, symbol="URA", side=Side.BUY, filled_qty=3)
+    broker = tuesday_broker(entry, open_orders=[older_stop, partial_fill])
+
+    run(engine, research_then_submit(), broker=broker, now=TUESDAY)
+
+    assert broker.cancelled == [entry.broker_order_id]
+    assert older_stop in broker.open_orders
+
+
+def test_an_entry_no_run_recorded_keeps_no_stop_and_says_so(
+    engine: Engine, conn: Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    partial_fill = replace(STALE_ENTRY, filled_qty=3)  # placed by something else, such as a local run
+    broker = fake_broker(open_orders=[*SMH_LEGS, partial_fill])
 
     result = run(engine, research_then_submit(), broker=broker)
 
+    assert broker.submitted == []
     assert result.summary.splitlines()[-2:] == [
-        "Shares with no stop, from partially filled entries cancelled with their stops:",
+        "Shares with no stop, from partially filled entries whose stop couldn't be re-placed:",
         "  IGV: 3 shares (entry igv-entry)",
     ]
-    (warning,) = [record for record in caplog.records if record.levelname == "WARNING"]
-    assert warning.getMessage() == "cancelled a partially filled entry, leaving its shares with no stop"
-    assert (warning.__dict__["symbol"], warning.__dict__["filled_qty"]) == ("IGV", 3)
+    (error,) = [record for record in caplog.records if record.levelname == "ERROR"]
+    assert error.getMessage() == "could not re-place a partially filled entry's stop"
+    assert (
+        error.__dict__["problem"]
+        == "no run here recorded it as a submitted buy, so its stop price is unknown"
+    )
+
+
+def test_a_stop_the_broker_refuses_is_an_error_order_and_leaves_the_shares_listed(
+    engine: Engine, conn: Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    entry = monday_entry(engine, conn)
+    refusal = BrokerError("HTTP 403: insufficient qty available for order")
+    broker = tuesday_broker(entry, cls=partial(FailingBroker, "URA", refusal))
+
+    result = run(engine, research_then_submit(), broker=broker, now=TUESDAY)
+
+    ((client_order_id, *_, status),) = stop_rows(conn)
+    assert (client_order_id, status) == ("llmt-2026-09-29-URA-stop", "error")
+    lines = result.summary.splitlines()
+    assert f"  stop 3 URA at ${entry.stop_price}: error (BrokerError: {refusal})" in lines
+    assert lines[-1] == f"  URA: 3 shares (entry {entry.broker_order_id})"
+    assert "order failed" in [record.getMessage() for record in caplog.records if record.levelname == "ERROR"]
+
+
+class SlowCancelBroker(FakeBroker):
+    """A broker whose stale-entry cancels haven't landed when it returns them."""
+
+    def cancel_open_buy_orders(self) -> list[CancelledOrder]:
+        return [replace(order, landed=False) for order in super().cancel_open_buy_orders()]
+
+
+def test_no_stop_is_placed_while_the_entrys_cancel_is_still_pending(
+    engine: Engine, conn: Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    entry = monday_entry(engine, conn)
+    broker = tuesday_broker(entry, cls=SlowCancelBroker)
+
+    result = run(engine, research_then_submit(), broker=broker, now=TUESDAY)
+
+    assert (broker.submitted, stop_rows(conn)) == ([], [])
+    assert result.summary.splitlines()[-1] == f"  URA: 3 shares (entry {entry.broker_order_id})"
+    (error,) = [record for record in caplog.records if record.levelname == "ERROR"]
+    assert error.__dict__["problem"] == "its cancel hasn't landed, so its legs still hold the shares"
 
 
 def test_a_leveraged_fund_is_rejected_by_its_asset_name(engine: Engine, conn: Connection) -> None:

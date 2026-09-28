@@ -4,8 +4,9 @@ This is the only module that sends orders (CLAUDE.md invariant 2). It sends them
 the orders the risk engine's verdicts hold. It commits in HANDOFF §9's order, so a crash never loses the
 record of a broker write:
 
-1. The run's row, once the guards pass. Then stale-entry cancels right after the cancel call, and the
-   account snapshot right after the account read.
+1. The run's row, once the guards pass. Then stale-entry cancels right after the cancel call, the stop
+   re-placed for a partially filled entry's shares right after its broker call, and the account snapshot
+   right after the account read.
 2. Tool calls, proposals with their verdicts, and malformed proposals, after evaluation.
 3. Each order, and an exit's cancelled legs, right after its broker call.
 4. The summary fields and the `completed` status, last.
@@ -46,7 +47,7 @@ from trader.models import (
     new_york_date,
     normalize_symbol,
 )
-from trader.risk import evaluate
+from trader.risk import evaluate, restored_stop
 from trader.settings import Config
 
 log = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ class OrderLine:
     qty: int
     status: OrderStatus
     detail: str  # the broker's ID and status, or why the order wasn't sent
+    stop_price: float | None = None  # set for a stop on its own: a partially filled entry's, re-placed
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -178,7 +180,8 @@ class _Run:
         self.meter = meter
         # Offline runs take the submit path against FakeBroker. The kill switch means no broker writes at all.
         self.writes_to_broker = run.mode in (RunMode.SUBMIT, RunMode.OFFLINE) and self.policy.trading_enabled
-        self.unprotected: list[CancelledOrder] = []  # partially filled entries cancelled with their stops
+        self.stop_lines: list[OrderLine] = []  # stops re-placed for partially filled entries' shares
+        self.unprotected: list[CancelledOrder] = []  # partially filled entries whose stop wasn't re-placed
         strategy = self.strategy
         self.universe = list(
             dict.fromkeys((strategy.benchmark, *strategy.sector_etfs, *strategy.industry_etfs))
@@ -210,7 +213,7 @@ class _Run:
             names,
         )
         proposal_ids = self._record_decisions(agent, verdicts)
-        orders = self._send_orders(verdicts, proposal_ids)
+        orders = self.stop_lines + self._send_orders(verdicts, proposal_ids)
         usage = self.meter.usage
         with self.engine.begin() as conn:
             repo.finish_run(
@@ -242,7 +245,11 @@ class _Run:
     # ---- Steps ---------------------------------------------------------------------------------------------
 
     def _cancel_stale_entries(self) -> None:
-        """HANDOFF §3 step 1: earlier runs' unfilled entries, whose legs go with them."""
+        """HANDOFF §3 step 1: earlier runs' unfilled entries, whose legs go with them.
+
+        A partially filled entry's legs aren't active yet, and cancelling it cancels them, so the shares it
+        bought get their stop back as an order of its own (HANDOFF §8).
+        """
         if not self.writes_to_broker:
             return
         cancelled = self.broker.cancel_open_buy_orders()
@@ -255,19 +262,38 @@ class _Run:
                     symbol=order.symbol,
                     reason=CancelReason.STALE_ENTRY,
                 )
-        # A partially filled entry's legs aren't active yet, and cancelling it cancels them: the shares it
-        # bought are left with no stop (HANDOFF §8 and §20).
-        self.unprotected = [order for order in cancelled if order.filled_qty > 0]
-        for order in self.unprotected:
-            log.warning(
-                "cancelled a partially filled entry, leaving its shares with no stop",
-                extra={
-                    "run_id": self.run_id,
-                    "symbol": order.symbol,
-                    "filled_qty": order.filled_qty,
-                    "broker_order_id": order.broker_order_id,
-                },
-            )
+        for entry in cancelled:
+            if entry.filled_qty > 0:
+                self._restore_stop(entry)
+
+    def _restore_stop(self, entry: CancelledOrder) -> None:
+        """Re-place the stop the risk engine approved for this entry, for the shares it bought."""
+        facts = {
+            "run_id": self.run_id,
+            "symbol": entry.symbol,
+            "filled_qty": entry.filled_qty,
+            "broker_order_id": entry.broker_order_id,
+        }
+        log.warning("cancelled a partially filled entry, and its stop with it", extra=facts)
+        with self.engine.connect() as conn:
+            original = repo.entry_order(conn, entry.broker_order_id)
+        stop = (
+            None if original is None else restored_stop(entry.symbol, entry.filled_qty, original.stop_price)
+        )
+        if not entry.landed:
+            problem = "its cancel hasn't landed, so its legs still hold the shares"
+        elif original is None:
+            problem = "no run here recorded it as a submitted buy, so its stop price is unknown"
+        elif stop is None:
+            problem = "it filled no whole share, or its recorded stop price isn't usable"
+        else:
+            line = self._send(stop, opens_new_position=False, proposal_id=original.proposal_id)
+            self.stop_lines.append(line)
+            if line.status is not OrderStatus.SUBMITTED:
+                self.unprotected.append(entry)
+            return
+        log.error("could not re-place a partially filled entry's stop", extra=facts | {"problem": problem})
+        self.unprotected.append(entry)
 
     def _read_account(self) -> AccountState:
         account = self.broker.get_account()
@@ -360,7 +386,9 @@ class _Run:
         return lines
 
     def _send(self, order: Order, opens_new_position: bool, proposal_id: int) -> OrderLine:
-        client_order_id = f"llmt-{self.run.run_date.isoformat()}-{order.symbol}-{order.side.value}"
+        # A re-placed stop ends in -stop, so it can't clash with that day's exit of the symbol (HANDOFF §8).
+        kind = "stop" if order.is_stop else order.side.value
+        client_order_id = f"llmt-{self.run.run_date.isoformat()}-{order.symbol}-{kind}"
 
         def record(status: OrderStatus, **outcome: str) -> OrderLine:
             with self.engine.begin() as conn:
@@ -379,14 +407,19 @@ class _Run:
                 )
             detail = ", ".join(outcome.values())
             return OrderLine(
-                side=order.side, symbol=order.symbol, qty=order.qty, status=status, detail=detail
+                side=order.side,
+                symbol=order.symbol,
+                qty=order.qty,
+                status=status,
+                detail=detail,
+                stop_price=order.stop_price if order.is_stop else None,
             )
 
         if not self.writes_to_broker:
             reason = KILL_SWITCH if not self.policy.trading_enabled else DRY_RUN
             return record(OrderStatus.NOT_SUBMITTED, not_submitted_reason=reason)
         try:
-            if order.side is Side.SELL:
+            if order.side is Side.SELL and not order.is_stop:  # an exit; a stop holds no other order's shares
                 self._cancel_exit_legs(order.symbol)
             receipt = self.broker.submit(order, client_order_id)
         except BrokerError as exc:  # the broker failed or refused this order; the others still go
@@ -478,7 +511,8 @@ def format_summary(
     unprotected: Sequence[CancelledOrder] = (),
 ) -> str:
     """The one-screen summary a run ends with (HANDOFF §9): date, mode, equity, cost, prompt version,
-    market view, then one line per verdict and per order, and shares a cancelled entry left with no stop."""
+    market view, then one line per verdict and per order, and any shares a cancelled, partially filled entry
+    left with no stop because its stop couldn't be re-placed."""
     lines = [
         f"{run.run_date.isoformat()} · {_mode(run)} · {status.value}",
         f"Equity {_usd(account.equity)} · cash {_usd(account.cash)} · prompt {run.prompt_version}",
@@ -493,22 +527,24 @@ def format_summary(
     ]
     if malformed:
         lines += [f"Malformed proposals: {len(malformed)}", *(f"  {item.error}" for item in malformed)]
-    lines += [
-        "Orders:" if orders else "Orders: none",
-        *(
-            f"  {line.side.value} {line.qty} {line.symbol}: {line.status.value} ({line.detail})"
-            for line in orders
-        ),
-    ]
+    lines += ["Orders:" if orders else "Orders: none", *(f"  {_order_line(line)}" for line in orders)]
     if unprotected:
         lines += [
-            "Shares with no stop, from partially filled entries cancelled with their stops:",
+            "Shares with no stop, from partially filled entries whose stop couldn't be re-placed:",
             *(
                 f"  {order.symbol}: {order.filled_qty:g} shares (entry {order.broker_order_id})"
                 for order in unprotected
             ),
         ]
     return "\n".join(lines)
+
+
+def _order_line(line: OrderLine) -> str:
+    if line.stop_price is not None:
+        order = f"stop {line.qty} {line.symbol} at {_usd(line.stop_price)}"
+    else:
+        order = f"{line.side.value} {line.qty} {line.symbol}"
+    return f"{order}: {line.status.value} ({line.detail})"
 
 
 def _verdict_line(verdict: Verdict) -> str:
