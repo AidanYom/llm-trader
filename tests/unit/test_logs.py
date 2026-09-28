@@ -3,22 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from collections.abc import Iterator
 from datetime import date
 from uuid import UUID
 
 import pytest
 
 from trader.logs import JsonFormatter, configure_logging
-
-
-@pytest.fixture
-def restore_root_logger() -> Iterator[None]:
-    root = logging.getLogger()
-    handlers, level = root.handlers[:], root.level
-    yield
-    root.handlers[:] = handlers
-    root.setLevel(level)
 
 
 def record(message: str, *args: object, **extra: object) -> logging.LogRecord:
@@ -63,9 +53,7 @@ def test_exceptions_are_included() -> None:
     assert "RuntimeError: broker timeout" in logged["exception"]
 
 
-def test_configure_logging_writes_json_to_stdout(
-    capsys: pytest.CaptureFixture[str], restore_root_logger: None
-) -> None:
+def test_configure_logging_writes_json_to_stdout(capsys: pytest.CaptureFixture[str]) -> None:
     configure_logging("debug")
 
     logging.getLogger("trader.test").debug("hello %s", "world", extra={"mode": "offline"})
@@ -74,7 +62,7 @@ def test_configure_logging_writes_json_to_stdout(
     assert (entry["message"], entry["level"], entry["mode"]) == ("hello world", "DEBUG", "offline")
 
 
-def test_configure_logging_refuses_an_unknown_level(restore_root_logger: None) -> None:
+def test_configure_logging_refuses_an_unknown_level() -> None:
     with pytest.raises(
         ValueError, match="LOG_LEVEL must be a logging level such as INFO or DEBUG, got 'loud'"
     ):
