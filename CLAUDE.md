@@ -96,6 +96,9 @@ make dry-run      # real Alpaca + Claude, no orders (needs .env keys)
 make submit       # real paper orders
 make report       # weekly markdown → reports/ (ARGS=--offline for offline runs)
 make smoke        # read-only Alpaca check
+make image        # build the Lambda image and check it offline
+make migrate-prod # alembic upgrade head against Neon (reads its URL from SSM with your AWS credentials)
+make report-prod  # weekly report from Neon (ARGS as for make report)
 ```
 
 Before asking for review, `make lint && make test` must pass locally, and CI must be green.
