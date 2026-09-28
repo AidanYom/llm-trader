@@ -67,3 +67,17 @@ jobs:
         run: docker build --platform linux/amd64 --provenance=false --sbom=false --target lambda -t llm-trader:ci .
       - name: Check the image imports the handler and loads its config (no network)
         run: docker run --rm -i --network none --entrypoint python llm-trader:ci - < docker/lambda_check.py
+
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The same pinned image as docker-compose.yml's terraform service. No backend and no AWS credentials:
+      # this checks formatting and the configuration itself, never the real resources.
+      - name: Terraform format, init and validate
+        run: |
+          tf() { docker run --rm -v "$PWD/infra:/infra" -w /infra hashicorp/terraform:1.16.4 "$@"; }
+          tf fmt -check -recursive -diff
+          tf init -backend=false -input=false -lockfile=readonly
+          tf validate
