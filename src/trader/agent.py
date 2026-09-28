@@ -7,19 +7,35 @@ with a `tool_result` block per call.
 
 from __future__ import annotations
 
+import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Final
+from typing import Final, Protocol
 
-from anthropic.types import ToolParam
+from anthropic.types import (
+    Message,
+    MessageParam,
+    TextBlockParam,
+    ThinkingConfigParam,
+    ToolParam,
+    ToolResultBlockParam,
+    ToolUseBlock,
+)
+from anthropic.types import Usage as ApiUsage
 
 from trader.briefing import dedupe_news, news_line, price_history_text, symbol_stats
 from trader.brokers.base import Broker
-from trader.models import Proposal, Side, SymbolStats, finite_float, normalize_symbol
+from trader.models import Prices, Proposal, Side, Strategy, SymbolStats, Usage, finite_float, normalize_symbol
+
+log = logging.getLogger(__name__)
 
 SUBMIT_PROPOSALS: Final = "submit_proposals"
+NUDGE: Final = "Call submit_proposals now. An empty list is fine."
+BUDGET_EXHAUSTED: Final = "Research budget exhausted. Call submit_proposals now."
+CUT_OFF: Final = "This response was cut off ({reason}), so the call did not run. Call it again."
+CUT_OFF_REASONS: Final = frozenset({"max_tokens", "refusal"})  # a tool call in such a response may be partial
 INVALID_SYMBOL: Final = "Invalid symbol."
 UNTRUSTED_TEXT: Final = "Untrusted third-party text:"
 PRICE_HISTORY_DAYS: Final = (5, 60, 120)  # the lowest, default and highest `days`
@@ -27,9 +43,8 @@ NEWS_DAYS: Final = (1, 3, 7)
 SESSIONS_FETCHED: Final = 64  # at least: enough for the 3-month return and the 20-day stats, whatever `days`
 SESSIONS_LISTED: Final = 30  # at most
 NEWS_ITEMS: Final = 20  # at most
-PERCENT_LIMIT: Final = (
-    1_000.0  # a percentage this large in magnitude is malformed: it wouldn't fit its column
-)
+# A percentage this large in magnitude is malformed: it wouldn't fit its NUMERIC(6,2) column.
+PERCENT_LIMIT: Final = 1_000.0
 
 # HANDOFF Appendix B, verbatim; a test compares them. Claude gets no other tools, and none of these can place,
 # change or cancel an order (CLAUDE.md invariant 1).
@@ -125,6 +140,200 @@ TOOLS: Final[list[ToolParam]] = [
         },
     },
 ]
+
+
+# ---- The loop ----------------------------------------------------------------------------------------------
+
+
+class MessagesAPI(Protocol):
+    def create(
+        self,
+        *,
+        model: str,
+        max_tokens: int,
+        system: Iterable[TextBlockParam],
+        tools: Iterable[ToolParam],
+        messages: Iterable[MessageParam],
+        thinking: ThinkingConfigParam,
+    ) -> Message: ...
+
+
+class ModelClient(Protocol):
+    """The part of `anthropic.Anthropic` the loop uses. ScriptedClient provides it too."""
+
+    @property
+    def messages(self) -> MessagesAPI: ...
+
+
+class UsageMeter:
+    """A run's token usage and its cost, added to after every model call (HANDOFF §5).
+
+    run_daily owns it, so a run that fails partway still records what it spent.
+    """
+
+    def __init__(self, prices: Prices) -> None:
+        self._prices = prices
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cache_write_tokens = 0
+        self.cache_read_tokens = 0
+
+    def add(self, usage: ApiUsage) -> None:
+        self.input_tokens += usage.input_tokens
+        self.output_tokens += usage.output_tokens
+        self.cache_write_tokens += usage.cache_creation_input_tokens or 0
+        self.cache_read_tokens += usage.cache_read_input_tokens or 0
+
+    @property
+    def usage(self) -> Usage:
+        prices = self._prices
+        cost = (
+            self.input_tokens * prices.input
+            + self.output_tokens * prices.output
+            + self.cache_write_tokens * prices.cache_write
+            + self.cache_read_tokens * prices.cache_read
+        ) / 1e6
+        return Usage(
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            cache_write_tokens=self.cache_write_tokens,
+            cache_read_tokens=self.cache_read_tokens,
+            cost_usd=cost,
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ToolCall:
+    """One of the model's tool calls, as the tool_calls table stores it."""
+
+    seq: int
+    name: str
+    input: object
+    result: str | None  # None when no result went back: submit_proposals, and calls that never ran
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AgentResult:
+    submitted: bool
+    submission: Submission  # empty when the model never submitted
+    tool_calls: tuple[ToolCall, ...]
+    stats: dict[str, SymbolStats]  # from get_price_history, for the risk engine
+    researched: frozenset[str]  # symbols whose bars the tools fetched
+    turns: int
+
+
+def run_agent(
+    client: ModelClient,
+    *,
+    strategy: Strategy,
+    system_prompt: str,
+    briefing: str,
+    broker: Broker,
+    now: datetime,
+    meter: UsageMeter,
+) -> AgentResult:
+    """The tool loop (HANDOFF §5): research within the budget, then one submit_proposals call.
+
+    The system prompt and the briefing each carry a cache marker, because every turn resends them.
+    """
+    tools = ResearchTools(broker, now)
+    system: list[TextBlockParam] = [
+        {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
+    ]
+    messages: list[MessageParam] = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": briefing, "cache_control": {"type": "ephemeral"}}],
+        }
+    ]
+    calls: list[ToolCall] = []
+    research_calls = 0
+    tool_less = 0  # responses in a row without a tool call
+    submission: Submission | None = None
+    turns = 0
+
+    def record(block: ToolUseBlock, result: str | None) -> None:
+        calls.append(ToolCall(seq=len(calls), name=block.name, input=block.input, result=result))
+
+    while turns < strategy.max_turns:
+        response = client.messages.create(
+            model=strategy.model,
+            max_tokens=strategy.max_tokens,
+            system=system,
+            tools=TOOLS,
+            messages=messages,
+            thinking={"type": "disabled"},
+        )
+        turns += 1
+        meter.add(response.usage)
+        _log_turn(turns, response)
+        messages.append({"role": "assistant", "content": response.content})
+        uses = [block for block in response.content if isinstance(block, ToolUseBlock)]
+        if not uses:
+            tool_less += 1
+            if tool_less == 2 or turns == strategy.max_turns:
+                break
+            messages.append({"role": "user", "content": NUDGE})
+            continue
+        tool_less = 0
+        cut_off = response.stop_reason in CUT_OFF_REASONS
+        submit = None if cut_off else next((block for block in uses if block.name == SUBMIT_PROPOSALS), None)
+        if submit is not None or turns == strategy.max_turns:
+            # The loop ends here, so no call in this response gets a result.
+            for block in uses:
+                record(block, None)
+            if submit is not None:
+                submission = parse_submission(submit.input)
+            break
+        results: list[ToolResultBlockParam] = []
+        for block in uses:
+            if cut_off:
+                outcome = ToolOutcome(CUT_OFF.format(reason=response.stop_reason), is_error=True)
+            else:
+                research_calls += 1
+                over_budget = research_calls > strategy.max_tool_calls
+                outcome = (
+                    ToolOutcome(BUDGET_EXHAUSTED) if over_budget else tools.call(block.name, block.input)
+                )
+            record(block, outcome.text)
+            results.append(_result(block, outcome))
+        messages.append({"role": "user", "content": results})
+
+    if submission is None:
+        log.warning("the model never called submit_proposals", extra={"turns": turns})
+    return AgentResult(
+        submitted=submission is not None,
+        submission=Submission(market_view=None) if submission is None else submission,
+        tool_calls=tuple(calls),
+        stats=dict(tools.stats),
+        researched=frozenset(tools.fetched),
+        turns=turns,
+    )
+
+
+def _result(block: ToolUseBlock, outcome: ToolOutcome) -> ToolResultBlockParam:
+    result: ToolResultBlockParam = {"type": "tool_result", "tool_use_id": block.id, "content": outcome.text}
+    if outcome.is_error:
+        result["is_error"] = True
+    return result
+
+
+def _log_turn(turn: int, response: Message) -> None:
+    usage = response.usage
+    log.info(
+        "model turn %d ended with %s",
+        turn,
+        response.stop_reason,
+        extra={
+            "turn": turn,
+            "stop_reason": response.stop_reason,
+            "tool_calls": [block.name for block in response.content if isinstance(block, ToolUseBlock)],
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_write_tokens": usage.cache_creation_input_tokens or 0,
+            "cache_read_tokens": usage.cache_read_input_tokens or 0,
+        },
+    )
 
 
 # ---- The research tools ------------------------------------------------------------------------------------
