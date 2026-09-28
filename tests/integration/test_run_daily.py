@@ -407,6 +407,15 @@ def test_only_one_submit_run_a_day(engine: Engine, conn: Connection) -> None:
     assert run(engine, research_then_submit(), mode=RunMode.DRY_RUN).status is RunStatus.COMPLETED
 
 
+def test_a_leftover_running_submit_run_blocks_the_day_without_force(engine: Engine, conn: Connection) -> None:
+    stale = past_submit_run(conn, started_at=MONDAY - timedelta(hours=2))
+
+    result = run(engine, research_then_submit())
+
+    assert (result.status, run_row(conn, result).skip_reason) == (RunStatus.SKIPPED, ALREADY_RAN)
+    assert conn.execute(select(runs.c.status).where(runs.c.id == stale)).scalar_one() == "running"
+
+
 def test_force_abandons_a_stale_running_row(engine: Engine, conn: Connection) -> None:
     stale = past_submit_run(conn, started_at=MONDAY - timedelta(minutes=30))
 
