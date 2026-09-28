@@ -16,6 +16,7 @@ from trader.agent import (
     AgentResult,
     ModelClient,
     UsageMeter,
+    anthropic_client,
     run_agent,
 )
 from trader.brokers.base import BrokerError
@@ -349,3 +350,12 @@ def test_the_real_client_has_the_shape_the_loop_needs() -> None:
     client: ModelClient = anthropic.Anthropic(api_key="test-key-not-real")
 
     assert callable(client.messages.create)
+
+
+def test_the_real_client_waits_two_minutes_and_retries_twice() -> None:
+    # A 4,000-token turn can take over a minute (HANDOFF §5). Building the client makes no network call.
+    client = anthropic_client("test-key-not-real")
+    loop_client: ModelClient = client
+
+    assert (client.timeout, client.max_retries) == (120.0, 2)
+    assert callable(loop_client.messages.create)

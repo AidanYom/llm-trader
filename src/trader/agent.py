@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Final, Protocol
 
+import anthropic
 from anthropic.types import (
     Message,
     MessageParam,
@@ -163,6 +164,16 @@ class ModelClient(Protocol):
 
     @property
     def messages(self) -> MessagesAPI: ...
+
+
+# A 4,000-token turn can take over a minute, and the SDK retries a timed-out request (HANDOFF §5).
+CLIENT_TIMEOUT_S: Final = 120.0
+CLIENT_MAX_RETRIES: Final = 2
+
+
+def anthropic_client(api_key: str) -> anthropic.Anthropic:
+    """The real Claude client for dry-run and submit runs. Building it makes no network call."""
+    return anthropic.Anthropic(api_key=api_key, timeout=CLIENT_TIMEOUT_S, max_retries=CLIENT_MAX_RETRIES)
 
 
 class UsageMeter:
