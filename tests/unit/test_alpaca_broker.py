@@ -226,6 +226,7 @@ class FakeTrading:
         self.groups = [{uid(number) for number in group} for group in groups]  # cancelled together
         self.pending_checks: dict[str, int] = {}  # status checks an order's cancel stays pending for
         self.fills_when_cancelled: dict[str, str] = {}  # filled_qty an order reports once its cancel is asked
+        self.filled_before_cancel: set[str] = set()  # entries whose last shares fill as their cancel arrives
         self.cancel_failures: dict[str, Exception] = {}
         self.submit_failure: Exception | None = None
         self.placed_before_failing = False  # the submit fails, but Alpaca has the order
@@ -302,6 +303,9 @@ class FakeTrading:
         if key in self.cancel_failures:
             raise self.cancel_failures[key]
         order = self.orders[key]
+        if key in self.filled_before_cancel:  # the order is complete, so Alpaca refuses the cancel
+            order.status, order.filled_qty = OrderStatus.FILLED, order.qty
+            raise api_error(422, "order is not cancelable")
         if order.status.value in FINISHED or order.status == OrderStatus.PENDING_CANCEL:
             raise api_error(422, "order is not cancelable")
         for member in next((group for group in self.groups if key in group), {key}):
@@ -683,6 +687,51 @@ def test_stale_entries_are_the_open_buys_each_cancelled_by_id() -> None:
     assert trading.orders[uid(3)].status == OrderStatus.NEW
 
 
+def test_stale_cancels_are_waited_for_so_a_partial_fill_reports_its_final_shares() -> None:
+    """run.py re-places the stop for these shares, which the entry's legs hold until the cancel lands."""
+    trading = FakeTrading(orders=[alpaca_order(2, "URA", "buy", status="partially_filled", filled_qty="3")])
+    trading.pending_checks[uid(2)] = 1  # still being cancelled when first re-read
+    trading.fills_when_cancelled[uid(2)] = "4"  # and one more share filled before the cancel landed
+    ticker = Ticker()
+
+    cancelled = broker(trading, ticker=ticker).cancel_open_buy_orders()
+
+    assert cancelled == [CancelledOrder(broker_order_id=uid(2), symbol="URA", filled_qty=4.0, landed=True)]
+    assert ticker.sleeps == [0.5]
+
+
+def test_a_stale_cancel_still_pending_after_eight_seconds_comes_back_not_landed() -> None:
+    trading = FakeTrading(orders=[alpaca_order(2, "URA", "buy", status="partially_filled", filled_qty="3")])
+    trading.pending_checks[uid(2)] = 1_000
+    ticker = Ticker()
+
+    cancelled = broker(trading, ticker=ticker).cancel_open_buy_orders()
+
+    assert cancelled == [CancelledOrder(broker_order_id=uid(2), symbol="URA", filled_qty=3.0, landed=False)]
+    assert ticker.sleeps == [0.5] * 16
+
+
+def test_an_entry_that_fills_before_its_cancel_lands_keeps_its_legs_and_is_left_out() -> None:
+    trading = FakeTrading(
+        orders=[
+            alpaca_order(1, "IGV", "buy"),
+            alpaca_order(2, "URA", "buy", status="partially_filled", filled_qty="3"),
+        ]
+    )
+    trading.filled_before_cancel.add(uid(2))
+
+    cancelled = broker(trading).cancel_open_buy_orders()
+
+    assert cancelled == [CancelledOrder(broker_order_id=uid(1), symbol="IGV", filled_qty=0.0)]
+
+
+def test_no_stale_entries_means_nothing_to_wait_for() -> None:
+    ticker = Ticker()
+
+    assert broker(FakeTrading(), ticker=ticker).cancel_open_buy_orders() == []
+    assert ticker.sleeps == []
+
+
 def test_an_exit_waits_until_its_legs_cancels_have_landed() -> None:
     trading = FakeTrading(
         orders=[alpaca_order(3, "SMH", "sell", type="stop"), alpaca_order(4, "SMH", "sell")],
@@ -781,6 +830,29 @@ def test_a_sell_is_a_full_exit_at_market_for_the_day() -> None:
         "time_in_force": "day",
         "client_order_id": "llmt-2026-09-28-SMH-sell",
     }
+
+
+def test_a_stop_on_its_own_is_a_gtc_stop_sell() -> None:
+    order = Order(symbol="XLK", side=Side.SELL, qty=4, stop_price=180.57)
+
+    assert json.loads(json.dumps(order_request(order, "llmt-2026-09-29-XLK-stop").to_request_fields())) == {
+        "symbol": "XLK",
+        "qty": 4,
+        "side": "sell",
+        "type": "stop",
+        "time_in_force": "gtc",
+        "stop_price": 180.57,
+        "client_order_id": "llmt-2026-09-29-XLK-stop",
+    }
+
+
+def test_a_refused_stop_is_named_as_a_stop() -> None:
+    trading = FakeTrading()
+    trading.submit_failure = api_error(403, "insufficient qty available for order")
+    stop = Order(symbol="XLK", side=Side.SELL, qty=4, stop_price=180.57)
+
+    with pytest.raises(BrokerError, match="^submit stop 4 XLK: HTTP 403: .*insufficient qty"):
+        broker(trading).submit(stop, "llmt-2026-09-29-XLK-stop")
 
 
 def test_submit_returns_alpacas_receipt() -> None:

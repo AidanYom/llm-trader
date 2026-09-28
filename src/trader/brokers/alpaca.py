@@ -50,6 +50,7 @@ from alpaca.trading.requests import (
     MarketOrderRequest,
     OrderRequest,
     StopLossRequest,
+    StopOrderRequest,
     TakeProfitRequest,
 )
 
@@ -234,9 +235,11 @@ class AlpacaBroker:
     # ---- Broker: orders ------------------------------------------------------------------------------------
 
     def cancel_open_buy_orders(self) -> list[CancelledOrder]:
-        """Cancel every open buy: earlier runs' entries, whose unfilled legs Alpaca cancels with them.
+        """Cancel every open buy, earlier runs' entries, whose unfilled legs Alpaca cancels with them.
 
-        It doesn't wait for the cancels to land: the model's turns come before any new entry is sent.
+        It waits for the cancels, so a partially filled entry's filled shares are final and its legs no longer
+        hold them when run.py re-places their stop (HANDOFF §8). An entry that fills completely before its
+        cancel lands keeps its legs, so it isn't returned.
         """
         with _broker_errors("cancel open buy orders"):
             request = GetOrdersRequest(status=QueryOrderStatus.OPEN, side=OrderSide.BUY, limit=ORDERS_LIMIT)
@@ -245,9 +248,13 @@ class AlpacaBroker:
                 self._cancel(entry)
             return [
                 CancelledOrder(
-                    broker_order_id=str(entry.id), symbol=entry.symbol or "", filled_qty=_filled(entry)
+                    broker_order_id=str(entry.id),
+                    symbol=entry.symbol or "",
+                    filled_qty=_filled(entry),
+                    landed=entry.status in FINISHED,
                 )
-                for entry in entries
+                for entry in self._settle(entries)
+                if entry.status is not OrderStatus.FILLED
             ]
 
     def cancel_open_orders(self, symbol: str) -> list[str]:
@@ -268,7 +275,8 @@ class AlpacaBroker:
         belongs to an earlier run, such as the one a --force rerun replaces, so the failure stands
         (HANDOFF §8).
         """
-        with _broker_errors(f"submit {order.side.value} {order.qty} {order.symbol}"):
+        kind = "stop" if order.is_stop else order.side.value
+        with _broker_errors(f"submit {kind} {order.qty} {order.symbol}"):
             request = order_request(order, client_order_id)
             started = self._clock()
             try:
@@ -321,6 +329,20 @@ class AlpacaBroker:
             if self._monotonic() >= deadline:
                 waiting = ", ".join(f"{order_id} ({statuses[order_id].value})" for order_id in pending)
                 raise Unusable(f"cancels still pending after {CANCEL_WAIT_S:g} s: {waiting}")
+            self._sleep(CANCEL_POLL_S)
+
+    def _settle(self, orders: Sequence[AlpacaOrder]) -> list[AlpacaOrder]:
+        """Each order's latest state, polled until every one is finished or the wait runs out (HANDOFF §8).
+
+        Unlike an exit's wait, this never raises: a stale entry that fills more shares while its cancel is
+        pending just reports them, and one still pending at the end comes back unfinished.
+        """
+        latest = list(orders)
+        deadline = self._monotonic() + CANCEL_WAIT_S
+        while True:
+            latest = [order if order.status in FINISHED else self._order(order.id) for order in latest]
+            if all(order.status in FINISHED for order in latest) or self._monotonic() >= deadline:
+                return latest
             self._sleep(CANCEL_POLL_S)
 
     def _placed_since(self, client_order_id: str, started: datetime) -> AlpacaOrder | None:
@@ -504,13 +526,24 @@ def _timestamp(value: object) -> datetime | None:
     return (moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)).astimezone(UTC)
 
 
-def order_request(order: Order, client_order_id: str) -> LimitOrderRequest | MarketOrderRequest:
+def order_request(
+    order: Order, client_order_id: str
+) -> LimitOrderRequest | MarketOrderRequest | StopOrderRequest:
     """The Alpaca request for an order the risk engine built (HANDOFF §8).
 
     A buy is a GTC limit order with a stop leg (OTO), plus a take-profit leg when it has one (bracket). GTC
     keeps the legs at the broker after the entry fills, and nothing trades in extended hours. A sell is a full
-    exit at market, good for the day.
+    exit at market, good for the day, or a protective stop on its own, good until cancelled like a leg.
     """
+    if order.is_stop and order.stop_price is not None:  # is_stop implies the price; this tells mypy
+        return StopOrderRequest(
+            symbol=order.symbol,
+            qty=order.qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC,
+            stop_price=order.stop_price,
+            client_order_id=client_order_id,
+        )
     if order.side is Side.SELL:
         return MarketOrderRequest(
             symbol=order.symbol,
