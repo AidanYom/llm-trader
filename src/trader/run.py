@@ -199,8 +199,15 @@ class _Run:
             meter=self.meter,
         )
         stats = self._stats(bars, agent)
+        buys = _proposed_buys(agent)
+        names = self.broker.get_asset_names(buys) if buys else {}
         verdicts = evaluate(
-            [parsed.proposal for parsed in agent.submission.proposals], account, stats, ctx, self.policy
+            [parsed.proposal for parsed in agent.submission.proposals],
+            account,
+            stats,
+            ctx,
+            self.policy,
+            names,
         )
         proposal_ids = self._record_decisions(agent, verdicts)
         orders = self._send_orders(verdicts, proposal_ids)
@@ -302,15 +309,7 @@ class _Run:
         """The risk engine's market data: the briefing's ETFs, the model's research, then any other buys."""
         stats = symbol_stats(bars) | agent.stats
         seen = {*self.universe, *agent.researched}
-        unseen = sorted(
-            {
-                symbol
-                for parsed in agent.submission.proposals
-                if parsed.proposal.action is Side.BUY
-                and (symbol := normalize_symbol(parsed.proposal.symbol)) is not None
-                and symbol not in seen
-            }
-        )
+        unseen = [symbol for symbol in _proposed_buys(agent) if symbol not in seen]
         if unseen:
             stats |= symbol_stats(self.broker.get_daily_bars(unseen, BUY_SESSIONS))
         return stats
@@ -395,6 +394,18 @@ class _Run:
                     symbol=symbol,
                     reason=CancelReason.EXIT_LEGS,
                 )
+
+
+def _proposed_buys(agent: AgentResult) -> list[str]:
+    """The valid symbols the model proposed buying, each once, sorted."""
+    return sorted(
+        {
+            symbol
+            for parsed in agent.submission.proposals
+            if parsed.proposal.action is Side.BUY
+            and (symbol := normalize_symbol(parsed.proposal.symbol)) is not None
+        }
+    )
 
 
 def _abandon_stale_run(conn: Connection, run: NewRun) -> None:

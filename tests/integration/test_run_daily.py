@@ -284,6 +284,29 @@ def test_cancelling_a_partially_filled_entry_warns_that_its_shares_have_no_stop(
     assert (warning.__dict__["symbol"], warning.__dict__["filled_qty"]) == ("IGV", 3)
 
 
+def test_a_leveraged_fund_is_rejected_by_its_asset_name(engine: Engine, conn: Connection) -> None:
+    config = replace(CONFIG, policy=replace(POLICY, blocked_name_patterns=("3X",)))
+    broker = fake_broker(asset_names={"TECL": "Direxion Daily Technology Bull 3X Shares"})
+
+    result = run(
+        engine, research_then_submit(proposal("TECL"), proposal("URA")), broker=broker, config=config
+    )
+
+    assert (
+        '  buy TECL: rejected · blocklist: TECL\'s name "Direxion Daily Technology Bull 3X Shares" '
+        'matches the blocked pattern "3X"'
+    ) in result.summary.splitlines()
+    assert any(line.startswith("  buy URA: approved") for line in result.summary.splitlines())
+
+
+def test_a_run_without_buys_looks_up_no_asset_names(engine: Engine, conn: Connection) -> None:
+    broker = fake_broker(open_orders=list(SMH_LEGS))
+
+    run(engine, research_then_submit(proposal("SMH", "sell")), broker=broker)
+
+    assert "get_asset_names" not in broker.calls
+
+
 def test_an_exit_cancels_its_legs_before_selling(engine: Engine, conn: Connection) -> None:
     broker = fake_broker(open_orders=list(SMH_LEGS))
 
