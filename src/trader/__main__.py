@@ -15,8 +15,9 @@ from pathlib import Path
 from trader.db.engine import DatabaseUrlError, make_engine
 from trader.db.repo import SchemaVersionError
 from trader.logs import configure_logging
-from trader.models import RunMode
+from trader.models import RunMode, new_york_date
 from trader.offline import offline_broker, offline_client
+from trader.report import write_report
 from trader.run import ForceRefusedError, LiveMoneyError, run_daily, utc_now
 from trader.settings import ConfigError, SecretError, Secrets, alpaca_paper, load_config
 
@@ -52,6 +53,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true", help="first abandon today's stale running submit run (submit mode)"
     )
     run.add_argument("--show-briefing", action="store_true", help="print the briefing before the summary")
+    report = commands.add_parser(
+        "report",
+        help="write the weekly review to reports/",
+        description="Write the weekly review of recent runs to reports/week-YYYY-MM-DD.md (HANDOFF §11).",
+    )
+    report.add_argument(
+        "--days", type=_positive, default=7, help="how many days to cover, today included (default 7)"
+    )
+    report.add_argument("--no-baseline", action="store_true", help="leave out the sector ETF baseline")
+    report.add_argument(
+        "--offline", action="store_true", help="report on offline runs instead of dry-run and submit runs"
+    )
     return parser
 
 
@@ -59,10 +72,45 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
-        return _run(args)
+        return _report(args) if args.command == "report" else _run(args)
     except USER_ERRORS as exc:
         print(f"trader: {exc}", file=sys.stderr)
         return 1
+
+
+def _positive(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        number = 0
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be a whole number of days >= 1, got {value!r}")
+    return number
+
+
+def _report(args: argparse.Namespace) -> int:
+    config = load_config(Path.cwd())
+    paper = alpaca_paper(os.environ)
+    now = utc_now()
+    # Offline runs' baseline comes from the same fake bars they traded on. The Alpaca adapter, for real runs,
+    # arrives in M4; until then their baseline shows as n/a.
+    broker = offline_broker(now, paper=paper) if args.offline else None
+    engine = make_engine(Secrets(os.environ).get("DATABASE_URL"))
+    try:
+        path = write_report(
+            engine,
+            today=new_york_date(now),
+            days=args.days,
+            paper=paper,
+            offline=args.offline,
+            basket=config.strategy.baseline_basket,
+            broker=broker,
+            baseline=not args.no_baseline,
+        )
+    finally:
+        engine.dispose()
+    print(f"Wrote {path}")
+    return 0
 
 
 def _run(args: argparse.Namespace) -> int:
