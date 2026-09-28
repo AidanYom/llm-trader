@@ -171,28 +171,55 @@ def finish_run(
             market_view=_optional_text(market_view),
             agent_submitted=agent_submitted,
             agent_turns=agent_turns,
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            cache_write_tokens=usage.cache_write_tokens,
-            cache_read_tokens=usage.cache_read_tokens,
-            cost_usd=_decimal(usage.cost_usd),
+            **_usage_values(usage),
         )
     )
     if result.rowcount != 1:
         raise RunStateError(f"run {run_id} is not running, so it can't be completed")
 
 
-def fail_run(conn: Connection, run_id: UUID, *, finished_at: datetime, error: str) -> None:
-    """Mark a running run `failed`, with the error's text (HANDOFF §9).
+def fail_run(
+    conn: Connection, run_id: UUID, *, finished_at: datetime, error: str, usage: Usage | None = None
+) -> None:
+    """Mark a running run `failed`, with the error's text and the API usage so far (HANDOFF §9).
 
     A run in any other state is left alone, without raising: this runs in run_daily's exception handler,
     where a new error would hide the one being recorded.
     """
+    values: dict[str, object] = {
+        "status": RunStatus.FAILED.value,
+        "finished_at": _aware(finished_at),
+        "error": _text(error),
+    }
+    if usage is not None:
+        values |= _usage_values(usage)
     conn.execute(
-        update(runs)
-        .where(runs.c.id == run_id, runs.c.status == RunStatus.RUNNING.value)
-        .values(status=RunStatus.FAILED.value, finished_at=_aware(finished_at), error=_text(error))
+        update(runs).where(runs.c.id == run_id, runs.c.status == RunStatus.RUNNING.value).values(values)
     )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RunningRun:
+    run_id: UUID
+    started_at: datetime
+
+
+def running_submit_run(conn: Connection, *, run_date: date, paper: bool) -> RunningRun | None:
+    """The day's `running` submit run, if there is one: `--force` checks its age before abandoning it."""
+    row = conn.execute(
+        select(runs.c.id, runs.c.started_at).where(
+            runs.c.run_date == _day(run_date),
+            runs.c.paper == paper,
+            runs.c.mode == RunMode.SUBMIT.value,
+            runs.c.status == RunStatus.RUNNING.value,
+        )
+    ).first()  # at most one row: uq_runs_one_submit_per_day allows one running submit run a day
+    if row is None:
+        return None
+    started_at: object = row.started_at
+    if not isinstance(started_at, datetime):
+        raise TypeError(f"expected a timestamp from the database, got {started_at!r}")
+    return RunningRun(run_id=_uuid(row.id), started_at=started_at)
 
 
 # ---- What a run saw and decided -----------------------------------------------------------------------
@@ -401,6 +428,16 @@ def risk_context(conn: Connection, *, run_date: date, paper: bool, peak_since: d
 
 
 # ---- Conversions at the database boundary ----------------------------------------------------------------
+
+
+def _usage_values(usage: Usage) -> dict[str, object]:
+    return {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_write_tokens": usage.cache_write_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+        "cost_usd": _decimal(usage.cost_usd),
+    }
 
 
 def _run_row(run: NewRun) -> dict[str, object]:
