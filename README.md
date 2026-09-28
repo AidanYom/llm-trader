@@ -22,11 +22,11 @@ make migrate   # create the tables in the dev database
 
 API keys are only needed for `make smoke`, `make dry-run` and `make submit`. For those, copy `.env.example` to `.env` (gitignored) and fill in the keys. Keep `ALPACA_PAPER=true`.
 
-**What costs money:** `make dry-run` and `make submit` call Claude, roughly $0.10–0.40 a run. The tests, `make offline` and `make smoke` are free: the tests and offline mode never touch the network, and smoke only reads from Alpaca's free plan.
+**What costs money:** `make dry-run` and `make submit` call Claude, roughly $0.10–0.40 a run. The tests, `make offline` and `make smoke` are free: the tests and offline mode never touch the network, and smoke only reads from Alpaca's free plan. Production's costs are listed under [Production](#production).
 
 ## Make targets
 
-Each target is a single `docker compose` command. Targets for later milestones fail until that milestone lands. The targets that run the app (`offline`, `dry-run`, `submit`, `report`, `smoke`) pass `ARGS` on, for example `make offline ARGS=--show-briefing`.
+Most targets are a single `docker compose` command; `image`, `push` and `deploy` take a few steps, spelled out in the Makefile. The targets that run the app (`offline`, `dry-run`, `submit`, `report`, `report-prod`, `smoke`) pass `ARGS` on, for example `make offline ARGS=--show-briefing`.
 
 | Target | What it does | Raw command | Works from |
 |---|---|---|---|
@@ -49,6 +49,14 @@ Each target is a single `docker compose` command. Targets for later milestones f
 | `make image` | Build the Lambda image, tagged with the commit, then check it without the network | `docker build --platform linux/amd64 --provenance=false --sbom=false --target lambda -t llm-trader:$(TAG) .`, then `docker run --rm -i --network none --entrypoint python llm-trader:$(TAG) - < docker/lambda_check.py` | M5 |
 | `make migrate-prod` | Apply migrations to production's Neon database (needs AWS credentials) | `docker compose run --rm prod alembic upgrade head` | M5 |
 | `make report-prod` | Weekly report on production's runs, from Neon (needs AWS credentials) | `docker compose run --rm prod trader report $(ARGS)` | M5 |
+| `make tf ARGS=…` | Terraform in its pinned container, for example `make tf ARGS=init` | `docker compose run --rm terraform $(ARGS)` | M5 |
+| `make aws ARGS=…` | The AWS CLI in its pinned container, for example `make aws ARGS="sts get-caller-identity"` | `docker compose run --rm aws $(ARGS)` | M5 |
+| `make secret name=X` | Store a secret in SSM as `/llm-trader/X`, prompting for it without showing it | `docker compose run --rm --entrypoint bash aws -c '…read -rsp… aws ssm put-parameter --type SecureString…' X` | M5 |
+| `make push` | Build the image, then push it to ECR unless that commit's image is already there (needs everything committed) | `make image`, then `docker login` to ECR, `docker tag` and `docker push` | M5 |
+| `make plan` | Show what `make deploy` would change, without building or pushing | `docker compose run --rm terraform plan -var image_tag=$(TAG)` | M5 |
+| `make deploy` | Push the image, then apply the Terraform with it, after showing the plan | `make push`, then `docker compose run --rm terraform apply -var image_tag=$(TAG)` | M5 |
+| `make invoke payload='…'` | Invoke the Lambda now, asynchronously, as the schedule does | `docker compose run --rm -T aws lambda invoke --function-name llm-trader --invocation-type Event --cli-binary-format raw-in-base64-out --payload '…' /dev/null` | M5 |
+| `make logs` | Follow the Lambda's logs from ten minutes back (`ARGS="--since 1d"` for more) | `docker compose run --rm aws logs tail /aws/lambda/llm-trader --follow --format short --since 10m` | M5 |
 
 `$(TAG)` is the short hash of the commit checked out.
 
@@ -83,6 +91,77 @@ In production the daily run is an AWS Lambda function built from the Dockerfile'
 - **`make image`** builds the image and checks it with no network: it must import the handler, load `config/` and then stop at the first missing secret.
 - **`make migrate-prod`** and **`make report-prod`** run Alembic and `trader report` against Neon. They use the `prod` Compose service, the app container with your AWS credentials from `~/.aws` (profile `llm-trader`, or whatever `AWS_PROFILE` names). It reads Neon's URL from SSM, so the URL never goes in `.env` or on a command line. Run `make migrate-prod` before deploying code that needs a new schema: the Lambda refuses to run against a database at any other revision.
 - **Once production runs, don't use `make submit` locally.** It records to the dev database, where the one-submit-run-per-day guard can't see the Lambda's run, so both could trade on the same day. `make dry-run` never sends orders.
+
+### What runs where
+
+Terraform creates the AWS side from the files in `infra/`: `make plan` shows what would change, and `make deploy` applies it after asking. Terraform keeps its record of what it created, its state, in an S3 bucket.
+
+| Piece | What it is |
+|---|---|
+| Lambda function `llm-trader` | Runs the container image on demand, billed by the second: 512 MB, a 15-minute limit, no automatic retries |
+| ECR repository `llm-trader` | AWS's Docker registry for the image, tagged with the commit; the last 10 images are kept |
+| EventBridge Scheduler `llm-trader-daily` | AWS's cron: 08:31 New York time, Monday to Friday, with no retries. Market holidays are skipped by the run itself |
+| SSM parameters `/llm-trader/*` | The four secrets, encrypted. Created by hand with `make secret`, so no value is in Terraform or git |
+| CloudWatch log group `/aws/lambda/llm-trader` | The function's JSON logs, kept 30 days |
+| Alarms and SNS topic `llm-trader-alerts` | Email when the function fails (`llm-trader-errors`) or a run logs an error, such as an order Alpaca refused (`llm-trader-error-logs`) |
+| Budget `aws-monthly` | Email when the account's AWS spend passes $5 in a month, or is forecast to |
+| Neon | Hosted Postgres 16 on the free plan, which the Lambda records to |
+
+`infra/terraform.tfvars` holds production's committed settings, such as `run_mode`. The alarm address goes in `infra/local.auto.tfvars`, which is gitignored.
+
+### Setting up production, once
+
+Run these from the repo root in Git Bash. The interactive ones (`make secret`, `make deploy`) need a real terminal (see [Windows notes](#windows-notes)).
+
+1. **AWS credentials.** Terraform and the AWS CLI read them from `~/.aws`, profile `llm-trader`. Use an IAM user's access keys (`make aws ARGS="configure --profile llm-trader"`) or IAM Identity Center (`make aws ARGS="configure sso --use-device-code --profile llm-trader"`, then `make aws ARGS="sso login --use-device-code"` whenever the session expires). Check with `make aws ARGS="sts get-caller-identity"`.
+2. **Terraform's state bucket.** New buckets are encrypted and block public access by default. Versioning keeps every earlier state:
+   ```bash
+   make aws ARGS="s3api create-bucket --bucket llm-trader-tfstate-7fc29959"
+   make aws ARGS="s3api put-bucket-versioning --bucket llm-trader-tfstate-7fc29959 --versioning-configuration Status=Enabled"
+   ```
+3. **The alarm address.** Copy `infra/local.auto.tfvars.example` to `infra/local.auto.tfvars` and put your address in it.
+4. **Neon.** Create a project on Postgres 16 in AWS us-east-1 (N. Virginia), with database `trader`. Under Connect, turn connection pooling off and copy the connection string, which includes `sslmode=require`.
+5. **The secrets.** Each command prompts for its value and shows nothing:
+   ```bash
+   make secret name=ALPACA_API_KEY
+   make secret name=ALPACA_SECRET_KEY
+   make secret name=ANTHROPIC_API_KEY
+   make secret name=DATABASE_URL
+   ```
+   Give the Lambda its own Anthropic key, so it can be revoked on its own. The first SecureString parameter also creates the `aws/ssm` encryption key that the function's permissions name, so this step comes before the first deploy.
+6. **Neon's tables:** `make migrate-prod`.
+7. **Terraform**, then the image repository on its own. The function can't be created until its image is in ECR, and the image can't be pushed until the repository exists:
+   ```bash
+   make tf ARGS=init
+   make tf ARGS="apply -target=aws_ecr_repository.trader -var image_tag=none"
+   ```
+8. **The first deploy:** `make deploy`. It builds and checks the image, pushes it, and runs `terraform apply`, which lists every change and waits for `yes`.
+9. **The alarm emails.** AWS sends a confirmation link to the alarm address. Nothing reaches you until it's clicked.
+
+### Rollout
+
+The first deploy has `run_mode = "dry_run"`, so scheduled runs call Claude and record orders but send none.
+
+1. **Test the alarm:** `make invoke payload='{"mode":"bogus"}'`. The run fails before reading a secret or calling Claude, so it's free, and the `llm-trader-errors` email arrives within about five minutes.
+2. **One dry run, on a trading day:** `make invoke payload='{"mode":"dry_run"}'`, then `make logs` until the `run completed` line and its summary appear. It costs one Claude run, about $0.10–0.40.
+3. **Switch to paper orders:** set `run_mode = "submit"` in `infra/terraform.tfvars`, commit, and `make deploy`. The next scheduled run places paper orders.
+
+### Deploying a change
+
+Commit, then `make deploy`: the image is tagged with the commit, so it refuses uncommitted changes. If the change needs a new schema, run `make migrate-prod` first. `make plan` shows what a deploy would change, for free.
+
+### Operating it
+
+- **Logs:** `make logs` follows the function's JSON logs. Each run ends with a `run completed` line that holds its summary.
+- **A run stuck `running` after a timeout:** `make invoke payload='{"mode":"submit","force":true}'`. It refuses if the stuck run started less than 20 minutes ago.
+- **The weekly report:** `make report-prod`, as for `make report`.
+- **Stopping at once:** `make aws ARGS="lambda put-function-concurrency --function-name llm-trader --reserved-concurrent-executions 0"` stops every invocation, and `make aws ARGS="lambda delete-function-concurrency --function-name llm-trader"` lets them run again. To keep runs researching but send no orders, set `trading_enabled: false` in `config/policy.yaml` and deploy.
+
+### What production costs
+
+- **AWS:** a few cents a month. Lambda, the scheduler, SSM, the logs, the alarms and SNS fit in AWS's free tiers. ECR stores roughly 0.3 GB of image layers at $0.10 per GB a month, and the state bucket holds a few kilobytes. The budget emails if the account's spend passes $5 a month.
+- **Claude:** every scheduled run, dry run or submit, costs about $0.10–0.40, so about $4 a month. A run skipped for a market holiday doesn't call Claude.
+- **Neon:** the free plan.
 
 ## Smoke check
 
@@ -202,13 +281,14 @@ To change the schema:
 
 ## CI
 
-GitHub Actions runs two jobs on every push and on pull requests to `main`. Both must pass before a merge.
+GitHub Actions runs three jobs on every push and on pull requests to `main`. All must pass before a merge.
 
 - `test` installs from the lock and runs Ruff's lint and format checks and mypy. Then, against a Postgres 16 service, it applies the migrations, runs `alembic check` (which fails if `tables.py` and the migrations disagree), and runs pytest.
-- `image` builds the Lambda image without pushing it.
+- `image` builds the Lambda image without pushing it, and runs `docker/lambda_check.py` inside it with no network.
+- `terraform` checks `infra/`'s formatting and validates it, with no backend and no AWS credentials.
 
 ## Windows notes
 
 - `.gitattributes` keeps every file LF. CRLF line endings break shell scripts inside the containers.
-- The interactive targets (`make shell`, `make psql`) need a real terminal, such as Windows Terminal or WSL2. In the classic Git Bash window (mintty), Docker reports "the input device is not a TTY"; prefixing the command with `winpty` works around it.
+- The interactive targets (`make shell`, `make psql`, `make secret`, `make deploy` and `make tf ARGS=apply`) need a real terminal, such as Windows Terminal or WSL2. In the classic Git Bash window (mintty), Docker reports "the input device is not a TTY"; prefixing the command with `winpty` works around it.
 - Git Bash rewrites arguments that look like absolute Unix paths, so `/app` becomes `C:/Program Files/Git/app`. The make targets avoid this. When you type such a docker command yourself, prefix it with `MSYS_NO_PATHCONV=1`.
