@@ -1,0 +1,21 @@
+model: claude-sonnet-5
+max_tokens: 4000
+max_turns: 15        # model calls per run, the nudge's included
+max_tool_calls: 12
+
+benchmark: SPY
+sector_etfs: [XLK, XLF, XLE, XLV, XLI, XLY, XLP, XLU, XLB, XLRE, XLC]
+industry_etfs: [SMH, IGV, KRE, XBI, ITB, XOP, XME, JETS, TAN, URA, IWM]
+baseline_basket: [XLK, XLF, XLE, XLV, XLI, XLY, XLP, XLU, XLB, XLRE, XLC]
+
+news_lookback_hours: 24
+max_news_items: 40
+
+price:               # USD per million tokens (Claude Sonnet 5)
+  input: 2.00
+  output: 10.00
+  cache_write: 2.50
+  cache_read: 0.20
+
+system_frame: config/system_frame.md
+strategy_prompt: config/strategy.md

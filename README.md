@@ -53,7 +53,7 @@ Dependencies are declared in `pyproject.toml` and pinned in `uv.lock`. To add on
 
 ## Configuration
 
-Settings live in `config/`. `src/trader/settings.py` reads them once at startup, and the app refuses to start if a file has an unknown, missing or unusable key. Each setting is documented here when it's added.
+Settings live in `config/`. `src/trader/settings.py` reads them once at startup, and the app refuses to start if a file has an unknown, missing or unusable key. Each setting is documented here when it's added. Paths are relative to the working directory: `/app` in the dev container, `/var/task` in the Lambda image.
 
 ### `config/policy.yaml`: risk limits and switches
 
@@ -76,6 +76,35 @@ The values are Aidan's; the file holds the current ones, and its comments explai
 | `drawdown_freeze_pct` | When equity is this far below its peak, buys are rejected. Sells still go through. | risk engine |
 | `drawdown_peak_since` | A date: only equity from then on counts toward the peak. `null` uses all history. Set it at go-live or after a paper reset. | risk-context query |
 | `blocked_symbols` | Tickers that can never be bought. Quote any that YAML would read as true, false or null, such as `'ON'`. | risk engine |
+
+### `config/strategy.yaml`: the model, research budget and ETF universe
+
+| Setting | What it does | Read by |
+|---|---|---|
+| `model` | The Claude model the agent calls. | agent (M3) |
+| `max_tokens` | The most output tokens per model call. | agent (M3) |
+| `max_turns` | The most model calls in one run, the nudge's included. | agent (M3) |
+| `max_tool_calls` | The most research tool calls (`get_price_history`, `get_news`) in one run. | agent (M3) |
+| `benchmark` | The index ETF the briefing measures relative strength against. | briefing |
+| `sector_etfs`, `industry_etfs` | The ETFs in the briefing's strength table. An ETF can't be in both. | briefing |
+| `baseline_basket` | The ETFs whose equal-weight buy-and-hold is the weekly report's baseline. | report (M3) |
+| `news_lookback_hours` | How far back the briefing's news goes. | run (M3) |
+| `max_news_items` | The most market headlines in the briefing. | briefing |
+| `price` | Claude's prices in USD per million tokens, for each run's cost. | agent (M3) |
+| `system_frame`, `strategy_prompt` | The two prompt files. | settings |
+
+### Prompts
+
+The system prompt is `config/system_frame.md`, a `---` separator, then `config/strategy.md` with its HTML comments removed. Its version, the first 10 hex characters of its SHA-256, is recorded with every run, and the `prompt_versions` table keeps each version's full text. Any edit to either file starts a new version, which is how results are attributed to prompts. `strategy.md` is Aidan's.
+
+### Secrets and environment
+
+The app reads `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ANTHROPIC_API_KEY` and `DATABASE_URL` when it needs them, once per process:
+
+- For a secret `NAME`, it uses the environment variable `NAME` when it's set and not blank. Locally that's `.env`, or `docker-compose.yml` for `DATABASE_URL`. An empty line in `.env`, such as `ANTHROPIC_API_KEY=`, counts as unset.
+- Otherwise it reads the SSM SecureString parameter that `NAME_SSM` names. That's how the Lambda function gets them (M5).
+
+`ALPACA_PAPER` must be `true` (the default when unset) or `false`. Anything else stops the app, so a typo can't point it at a live account.
 
 ## Database
 

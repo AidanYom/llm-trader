@@ -2,11 +2,28 @@ from __future__ import annotations
 
 import json
 import math
+from datetime import UTC, date, datetime
 from typing import Any
 
 import pytest
 
-from trader.models import Order, Side, Verdict, VerdictStatus, finite_float, normalize_symbol, to_cents
+from trader.models import (
+    Order,
+    Side,
+    Verdict,
+    VerdictStatus,
+    finite_float,
+    new_york_date,
+    normalize_symbol,
+    to_cents,
+)
+
+
+def test_new_york_date_is_the_date_in_new_york() -> None:
+    assert new_york_date(datetime(2026, 9, 28, 12, 31, tzinfo=UTC)) == date(2026, 9, 28)
+    assert new_york_date(datetime(2026, 9, 28, 3, 0, tzinfo=UTC)) == date(2026, 9, 27)  # 23:00 the day before
+    with pytest.raises(ValueError, match="has no time zone"):
+        new_york_date(datetime(2026, 9, 28, 8, 31))
 
 
 @pytest.mark.parametrize(
