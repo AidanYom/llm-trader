@@ -13,6 +13,10 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
+from zoneinfo import ZoneInfo
+
+# Run dates and session dates are New York dates (HANDOFF §10).
+NEW_YORK = ZoneInfo("America/New_York")
 
 # HANDOFF §5: letters, digits and dots, at most 10 characters, starting with a letter or digit.
 _SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9.]{0,9}")
@@ -56,6 +60,13 @@ class OrderStatus(StrEnum):
 class CancelReason(StrEnum):
     STALE_ENTRY = "stale_entry"  # an earlier run's unfilled entry, cancelled at the start of a submit run
     EXIT_LEGS = "exit_legs"  # a position's stop and take-profit legs, cancelled before its exit
+
+
+def new_york_date(moment: datetime) -> date:
+    """The America/New_York date of a moment, which must carry a time zone."""
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError(f"{moment!r} has no time zone")
+    return moment.astimezone(NEW_YORK).date()
 
 
 def normalize_symbol(raw: object) -> str | None:
