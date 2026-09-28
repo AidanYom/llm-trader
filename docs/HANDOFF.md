@@ -22,7 +22,7 @@ The account starts on **Alpaca paper trading**. It runs for about three months a
 
 - One account, one strategy: sector and industry outlook with small-cap bets (section 4).
 - **Long-only, US-listed stocks and ETFs, whole shares.** No options, no shorting, no margin, no crypto, no leveraged or inverse ETFs.
-- **Cash only.** Buys are limited by settled cash minus a buffer. Same-run sale proceeds never fund buys.
+- **Cash only.** Buys are limited by cash minus a buffer, and same-run sale proceeds never fund buys. Alpaca's cash includes sale proceeds that haven't settled yet. Settlement is next-day (T+1) and there's one pre-market run a day, so a sale from the previous session settles on the run's day, before anything bought that day settles.
 - **Exits are full exits.** A sell closes the entire position.
 - **Every buy carries a protective stop** at the broker.
 - **One run per trading day, pre-market.** No intraday runs or streaming.
@@ -69,8 +69,8 @@ The target changed after M3: the first limits (6 positions of up to 8%) capped i
 ## 5. Claude integration
 
 - **SDK:** `anthropic` Python SDK, Messages API. The model is `claude-sonnet-5`, set in `config/strategy.yaml`.
-- **Request settings:** `max_tokens` 4000 per turn. Client timeout 60 s with SDK `max_retries=2`.
-- **Thinking is off.** Claude Sonnet 5 runs adaptive thinking when a request leaves out `thinking`, and thinking tokens count against `max_tokens`, so every request sends `thinking: {"type": "disabled"}`. Anthropic's guidance for Sonnet 5 prefers adaptive thinking at low effort, because the model reaches for tools less readily with thinking off. That's an experiment for the M4 dry runs, and it needs a larger `max_tokens`.
+- **Request settings:** `max_tokens` 4000 per turn. Client timeout 120 s with SDK `max_retries=2`, set by `agent.anthropic_client()`. A 4,000-token turn can take over a minute, and the SDK retries a timed-out request, so a shorter timeout could fail a run on one long turn.
+- **Thinking is off.** Claude Sonnet 5 runs adaptive thinking when a request leaves out `thinking`, and thinking tokens count against `max_tokens`, so every request sends `thinking: {"type": "disabled"}`. Anthropic's guidance for Sonnet 5 prefers adaptive thinking at low effort, because the model reaches for tools less readily with thinking off. Runs don't record a thinking setting, so thinking stays off for the M4 dry runs. An experiment needs that setting recorded with each run, a larger `max_tokens` and a longer timeout.
 - **Prompt caching:**
   - The system prompt is sent as a single text block with `cache_control: {"type": "ephemeral"}`.
   - The first user message is one text block containing the briefing, also marked `cache_control: {"type": "ephemeral"}`, because the tool loop re-sends it every turn.
@@ -193,16 +193,20 @@ The data behind it:
   - `get_account() -> AccountState` (equity, cash, positions)
   - `get_daily_bars(symbols, sessions) -> {symbol: [Bar]}`: the last `sessions` completed sessions, oldest first
   - `get_news(symbols|None, since, limit) -> [NewsItem]`
-  - `cancel_open_buy_orders() -> [(broker_order_id, symbol)]`
+  - `cancel_open_buy_orders() -> [CancelledOrder(broker_order_id, symbol, filled_qty)]`
   - `cancel_open_orders(symbol) -> [ids]`: returns once every cancel has landed
   - `submit(order, client_order_id) -> SubmittedOrder(broker_order_id, status, client_order_id)`
-  - A failed call raises `BrokerError`.
-- **Environment:** `ALPACA_PAPER` defaults to `true`. `ALPACA_DATA_FEED` defaults to `sip`.
+  - A failed call raises `BrokerError`. `AlpacaBroker` turns every alpaca-py failure into one: an API error, a network error, or a response that doesn't validate.
+- **Environment:** `ALPACA_PAPER` defaults to `true`. `ALPACA_DATA_FEED` is `sip` (the default) or `delayed_sip`, which gives the same bars for history older than 15 minutes. Other feeds are refused: `iex` sees only a few percent of consolidated volume, so the liquidity floor (section 7) would reject nearly every buy.
+- **Timeouts:** alpaca-py sets no HTTP timeout, so `AlpacaBroker` gives every request 10 s to connect and 30 s to read. Otherwise a stalled connection would hang the run, and in Lambda leave its row `running`.
 - **Data:**
   - The free Basic data plan is enough. It includes real-time IEX data and consolidated (SIP) history, but only history more than 15 minutes old.
-  - Daily bars are requested with `TimeFrame.Day`, `feed=sip`, `adjustment=all`, and `end = now − 20 min`.
+  - Daily bars are requested with `TimeFrame.Day`, `feed=sip`, `adjustment=all`, and `end = now − 20 min`. The request starts far enough back to hold the sessions asked for (sessions × 7/5 + 10 calendar days), and the last ones are kept.
   - Any bar dated today (America/New_York) is dropped, so only completed sessions are used.
-  - News comes from Alpaca's news API (`NewsClient`, `NewsRequest`, `include_content=False`).
+  - News comes from Alpaca's news API (`NewsClient`, `NewsRequest`, `include_content=False`). It's read as raw JSON and each story is mapped on its own, so a malformed story is skipped and logged instead of failing the run.
+- **Account:** equity and cash from the account, and each position from `get_all_positions()`.
+  - A short position, or one that isn't a US stock or ETF, raises `BrokerError`: the app is long-only and trades nothing else (section 2).
+  - A value Alpaca leaves out is NaN, meaning unknown. Buys are then rejected under `account:` (section 7), and the snapshot stores NULL (section 10).
 - **Trading day:** the Alpaca calendar has an entry for today.
 - **Entries:**
   - Each entry is a `LimitOrderRequest` BUY with `TimeInForce.GTC` and the limit from the risk engine.
@@ -210,10 +214,24 @@ The data behind it:
   - With a stop and take-profit: `OrderClass.BRACKET` plus `StopLossRequest` and `TakeProfitRequest`.
   - GTC keeps the protective legs alive after the entry fills. Orders are submitted pre-market and queue for the open, with no extended hours.
 - **Stale entries:** at the start of every submit run, cancel all open BUY orders. Cancelling an unfilled parent cancels its legs.
+  - Alpaca only activates a bracket or OTO order's legs once the entry has completely filled, and cancelling any order in the group cancels the rest. So cancelling a partially filled entry leaves its filled shares with no stop.
+  - `cancel_open_buy_orders` reports each entry's filled quantity, and the run logs a warning and names those shares in its summary (section 20).
 - **Exits:** cancel every open order for the symbol (its stop and take-profit legs), wait until they're terminal, then send a `MarketOrderRequest` SELL for the full quantity with `TimeInForce.DAY`.
+  - Alpaca cancels a bracket's other leg along with the one cancelled, so a cancel that fails because the order is already cancelled, or being cancelled, isn't an error.
+  - If an order fills more shares while its cancel is pending, the position has changed: `cancel_open_orders` raises `BrokerError`, and the exit isn't sent.
 - **Waiting on cancels:** poll order status every 0.5 s for up to 8 s, until it's one of canceled, filled, expired, rejected, replaced or done_for_day. Until a cancel lands, the shares stay held for orders. If a cancel hasn't landed after 8 s, `cancel_open_orders` raises `BrokerError`, and the exit is recorded as an `error` order without being sent.
 - **Idempotency:** `client_order_id = f"llmt-{run_date}-{SYMBOL}-{side}"`. The broker rejects duplicates, so a rerun can't double-submit.
-- **`trader smoke`** is a read-only command that calls every read method (account, calendar, bars for SPY and XLK, news) and prints the results. It's the first thing to run with real keys.
+  - alpaca-py itself retries HTTP 429 and 504 responses, order submissions included. So a 504 can hide an order Alpaca accepted, and the retry is then refused as a duplicate.
+  - When a submit fails, `AlpacaBroker` looks the order up by `client_order_id`. If Alpaca created it during this call (allowing 30 s of clock skew), it's returned as submitted. Otherwise the failure stands, so a rerun's duplicate is still recorded as an `error` order.
+- **`trader smoke`** is the first thing to run with real keys. It's read-only: its broker type has no cancel or submit method, and it never touches the database. It prints:
+  - the account: status, blocks, equity, cash, buying power and positions
+  - the account configuration, with a warning unless `no_shorting` is true, `max_margin_multiplier` is 1 and `max_options_trading_level` is 0 or unset. Aidan sets these in Alpaca; the app never changes them.
+  - the calendar: whether today is a trading day, and the next sessions
+  - 70 sessions of bars for SPY and XLK, checked against the last completed session
+  - a bars request that includes an unknown ticker, which must be left out rather than fail the request
+  - market news from the last 24 hours, and SPY's news
+
+  It exits 1 if any read fails. Warnings don't change the exit code.
 
 ## 9. Run orchestration, modes and guards
 
@@ -259,7 +277,7 @@ Offline runs are excluded from risk-context queries and from reports.
 3. Each order row is committed right after its broker call, so a crash can never lose the record of a submitted order. An exit's cancelled legs are committed right after the cancel call. A `BrokerError` records the order as `error`, and the run carries on with the next order; any other exception fails the run.
 4. The final summary fields are written and the status is set to `completed`.
 
-**Logging:** standard-library logging to stdout with a JSON formatter, at INFO level. The run ends with a one-screen summary: date, mode, equity, cost, prompt version, market view, one line per verdict, and one line per order. Never log secrets.
+**Logging:** standard-library logging to stdout with a JSON formatter, at INFO level. The run ends with a one-screen summary: date, mode, equity, cost, prompt version, market view, one line per verdict, and one line per order. Never log secrets. The SDK and HTTP-library loggers stay at INFO or above even when `LOG_LEVEL` is DEBUG, because at DEBUG the Anthropic SDK logs whole request bodies and response headers.
 
 ## 10. Database
 
@@ -389,7 +407,7 @@ Offline runs are excluded from risk-context queries and from reports.
 - It covers the `dry_run` and `submit` runs of the account type that `ALPACA_PAPER` names, so paper and live results never mix.
 - Run counts include every status. Equity, behavior and the daily log use completed runs; each failed or abandoned run gets one daily-log line with its error. The API cost total includes failed runs, which record what they spent (section 9).
 - `--offline` reports on offline runs instead, into `reports/week-YYYY-MM-DD-offline.md`, with the baseline from `FakeBroker`'s bars.
-- `--no-baseline` skips the baseline. Until M4 adds the Alpaca adapter, a report on real runs shows the baseline as n/a.
+- `--no-baseline` skips the baseline. For real runs the baseline reads Alpaca's bars, so it needs the Alpaca keys, and `--no-baseline` doesn't. If the broker call fails, the baseline shows n/a with the error.
 
 **Scorecard:**
 - run counts by mode and status
@@ -520,6 +538,10 @@ Everything runs in Docker; nothing uses the host's Python.
     - Like Alpaca, it rejects a repeated `client_order_id`.
     - The offline scenario's fake market is open every day, so `make offline` also works at weekends. The tests' default calendar is weekdays only.
   - `ScriptedClient`: implements `.messages.create(**kwargs)` by returning prepared responses and records every call. It lives in `src/trader/scripted.py`, not `tests/`, because `make offline` runs it.
+- **The Alpaca adapter** is the Broker boundary itself, so its tests go one level down, still without the network:
+  - Its mapping functions run on alpaca-py's own model classes, built locally from JSON shaped like the API's responses. Order requests are checked through `to_request_fields()`, the JSON body alpaca-py would send.
+  - Its call sequences (cancel then wait, submit then look up, error translation) run against a fake of the alpaca-py clients' public methods. The fake is typed by protocols that mypy checks the real clients satisfy.
+  - Nothing patches alpaca-py or `requests`. `make smoke` and dry runs cover the live API.
 - **Unit tests** (no database):
   - **Risk engine:** normal buy with exact bracket prices; missing or out-of-range stop; trim to max position; an existing holding counts toward the cap; trim to cash after the buffer; price and liquidity floors; the average-dollar-volume trim; under one share; blocklist and unknown symbol; the drawdown freeze blocks buys but not sells; a sell is a full exit; no shorting; max open positions, with exits freeing slots; the weekly cap across multiple buys in one run; cash shared across buys in one run; duplicates; `target_pct` of 0; a take-profit too close to the entry is dropped.
   - **Agent:** research then submit (tool results feed stats; cache_control is present); the only tools are the three read-only ones; a nudge that recovers; a nudge that gives up; the research budget is enforced; malformed proposals; news tool output is labeled untrusted; invalid symbols are rejected.
@@ -640,6 +662,7 @@ Build in this order, one branch and pull request per milestone. Post a short pla
 - The weekly new-position count includes entries that never filled.
 - Only daily closes are used. A stock that gaps up more than the entry buffer doesn't fill, and the entry is cancelled the next run.
 - On Mondays, the 24-hour news window misses Friday evening and the weekend.
+- A partially filled entry has no active stop until it fills completely, when Alpaca activates its legs. Cancelling it the next morning cancels the legs, leaving the filled shares with no stop, and paper trading partially fills eligible orders 10% of the time. The run warns and names the shares (section 8); how to protect them is decided before `submit` is switched on in M5.
 
 ---
 
