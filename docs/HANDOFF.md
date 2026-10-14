@@ -286,7 +286,7 @@ Offline runs are excluded from risk-context queries and from reports.
 
 ## 10. Database
 
-- **Engine:** PostgreSQL 16 everywhere: local Compose, CI service container, and Neon in production.
+- **Engine:** PostgreSQL 18 everywhere: local Compose, CI service container, and Neon in production.
 - **Access:** SQLAlchemy 2.0 **Core** (table objects plus a small repository module of explicit functions; no ORM) with the `psycopg` 3 driver (`postgresql+psycopg://`).
 - **Migrations:** Alembic.
   - Every schema change is a reviewed migration with a working `downgrade`.
@@ -503,9 +503,9 @@ Everything runs in Docker; nothing uses the host's Python.
 
 **docker-compose.yml:**
 - `db`:
-  - `postgres:16`, with user, password and database all set to `trader`
+  - `postgres:18`, with user, password and database all set to `trader`
   - port 5432 published
-  - named volume `pgdata`
+  - named volume `pgdata`, mounted at `/var/lib/postgresql`: from 18 the image keeps its data in a versioned folder under it (`18/docker`)
   - `docker/initdb` mounted to create `trader_test`
   - `pg_isready` healthcheck
 - `app`:
@@ -585,7 +585,7 @@ Everything runs in Docker; nothing uses the host's Python.
 `.github/workflows/ci.yml` runs on pushes to any branch and on pull requests to `main`, with concurrency that cancels superseded runs on the same ref.
 
 - **Job `test`** (ubuntu-latest):
-  1. Start a `postgres:16` service container with a health check.
+  1. Start a `postgres:18` service container with a health check.
   2. `astral-sh/setup-uv` with caching, then `uv sync --frozen`.
   3. `ruff check .`, `ruff format --check .` and `mypy`.
   4. `alembic upgrade head` and `alembic check` (schema drift fails the build).
@@ -600,7 +600,7 @@ Everything runs in Docker; nothing uses the host's Python.
 **Region:** AWS `us-east-1`.
 
 **Database:** Neon free plan (100 compute-hours a month per project, scales to zero after 5 idle minutes, 0.5 GB storage).
-- Create one Neon project on Postgres 16 in the AWS us-east-1 region, with database `trader`.
+- Create one Neon project on Postgres 18 in the AWS us-east-1 region, with database `trader`.
 - The connection string (with `sslmode=require`) goes into SSM. Use the direct connection, with Neon's connection pooling off: a pooler adds nothing for one connection a day. The engine is built per invocation, and `pool_pre_ping` replaces a connection Neon dropped while Claude was working, so no pooling change is needed (no `NullPool`).
 
 **Secrets** are SSM SecureString parameters. Create them by hand with `make secret name=…`, which prompts without echoing, so the values never enter Terraform state, git or shell history:

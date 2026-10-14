@@ -105,7 +105,7 @@ Terraform creates the AWS side from the files in `infra/`: `make plan` shows wha
 | CloudWatch log group `/aws/lambda/llm-trader` | The function's JSON logs, kept 30 days |
 | Alarms and SNS topic `llm-trader-alerts` | Email when the function fails (`llm-trader-errors`) or a run logs an error, such as an order Alpaca refused (`llm-trader-error-logs`) |
 | Budget `aws-monthly` | Email when the account's AWS spend passes $5 in a month, or is forecast to |
-| Neon | Hosted Postgres 16 on the free plan, which the Lambda records to |
+| Neon | Hosted Postgres 18 on the free plan, which the Lambda records to |
 
 `infra/terraform.tfvars` holds production's committed settings, such as `run_mode`. The alarm address goes in `infra/local.auto.tfvars`, which is gitignored.
 
@@ -120,7 +120,7 @@ Run these from the repo root in Git Bash. The interactive ones (`make secret`, `
    make aws ARGS="s3api put-bucket-versioning --bucket llm-trader-tfstate-7fc29959 --versioning-configuration Status=Enabled"
    ```
 3. **The alarm address.** Copy `infra/local.auto.tfvars.example` to `infra/local.auto.tfvars` and put your address in it.
-4. **Neon.** Create a project on Postgres 16 in AWS us-east-1 (N. Virginia), with database `trader`. Under Connect, turn connection pooling off and copy the connection string, which includes `sslmode=require`.
+4. **Neon.** Create a project on Postgres 18 in AWS us-east-1 (N. Virginia), with database `trader`. Under Connect, turn connection pooling off and copy the connection string, which includes `sslmode=require`.
 5. **The secrets.** Each command prompts for its value and shows nothing:
    ```bash
    make secret name=ALPACA_API_KEY
@@ -262,7 +262,7 @@ The app reads `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ANTHROPIC_API_KEY` and `DA
 
 ## Database
 
-Postgres 16 records every run: its briefing, tool calls, proposals, verdicts, orders and cost (HANDOFF §10).
+Postgres 18 records every run: its briefing, tool calls, proposals, verdicts, orders and cost (HANDOFF §10).
 
 - `src/trader/db/tables.py` defines the schema with SQLAlchemy Core: table definitions plus a query builder, with no ORM.
 - `src/trader/db/repo.py` holds every query, as explicit functions.
@@ -283,7 +283,7 @@ To change the schema:
 
 GitHub Actions runs three jobs on every push and on pull requests to `main`. All must pass before a merge.
 
-- `test` installs from the lock and runs Ruff's lint and format checks and mypy. Then, against a Postgres 16 service, it applies the migrations, runs `alembic check` (which fails if `tables.py` and the migrations disagree), and runs pytest.
+- `test` installs from the lock and runs Ruff's lint and format checks and mypy. Then, against a Postgres 18 service, it applies the migrations, runs `alembic check` (which fails if `tables.py` and the migrations disagree), and runs pytest.
 - `image` builds the Lambda image without pushing it, and runs `docker/lambda_check.py` inside it with no network.
 - `terraform` checks `infra/`'s formatting and validates it, with no backend and no AWS credentials.
 
