@@ -46,8 +46,11 @@ Each target is a single `docker compose` command. Targets for later milestones f
 | `make smoke` | Read-only Alpaca check (needs keys) | `docker compose run --rm --no-deps app trader smoke $(ARGS)` | M4 |
 | `make dry-run` | Real Alpaca and Claude, no orders (needs keys) | `docker compose run --rm app trader run --mode dry-run $(ARGS)` | M4 |
 | `make submit` | Real paper orders (needs keys) | `docker compose run --rm app trader run --mode submit $(ARGS)` | M4 |
+| `make image` | Build the Lambda image, tagged with the commit, then check it without the network | `docker build --platform linux/amd64 --provenance=false --sbom=false --target lambda -t llm-trader:$(TAG) .`, then `docker run --rm -i --network none --entrypoint python llm-trader:$(TAG) - < docker/lambda_check.py` | M5 |
+| `make migrate-prod` | Apply migrations to production's Neon database (needs AWS credentials) | `docker compose run --rm prod alembic upgrade head` | M5 |
+| `make report-prod` | Weekly report on production's runs, from Neon (needs AWS credentials) | `docker compose run --rm prod trader report $(ARGS)` | M5 |
 
-M5 adds `image`, `push`, `deploy` and `migrate-prod`.
+`$(TAG)` is the short hash of the commit checked out.
 
 ## Running a day
 
@@ -70,6 +73,16 @@ Everything lands in the database. The run prints a one-screen summary. Logs are 
   - the account is live and `allow_live_money` is false
   - the market is closed
   - a submit run already completed that day
+
+## Production
+
+In production the daily run is an AWS Lambda function built from the Dockerfile's `lambda` target (HANDOFF §16). EventBridge Scheduler invokes it at 08:31 New York time on weekdays, and it records to a Neon Postgres database.
+
+- **The handler**, `trader.lambda_handler.handler`, takes its mode from the event's `mode`, or else from the `RUN_MODE` variable: `dry_run` or `submit`. Any other mode fails before a secret is read. `"force": true` in the event first abandons the day's stale `running` submit run, as `--force` does. It returns the run's ID, status and summary.
+- **Secrets** come from SSM Parameter Store, through the `*_SSM` variables (see [Secrets and environment](#secrets-and-environment)), and are read once per Lambda execution environment.
+- **`make image`** builds the image and checks it with no network: it must import the handler, load `config/` and then stop at the first missing secret.
+- **`make migrate-prod`** and **`make report-prod`** run Alembic and `trader report` against Neon. They use the `prod` Compose service, the app container with your AWS credentials from `~/.aws` (profile `llm-trader`, or whatever `AWS_PROFILE` names). It reads Neon's URL from SSM, so the URL never goes in `.env` or on a command line. Run `make migrate-prod` before deploying code that needs a new schema: the Lambda refuses to run against a database at any other revision.
+- **Once production runs, don't use `make submit` locally.** It records to the dev database, where the one-submit-run-per-day guard can't see the Lambda's run, so both could trade on the same day. `make dry-run` never sends orders.
 
 ## Smoke check
 
@@ -162,7 +175,7 @@ The system prompt is `config/system_frame.md`, a `---` separator, then `config/s
 The app reads `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ANTHROPIC_API_KEY` and `DATABASE_URL` when it needs them, once per process:
 
 - For a secret `NAME`, it uses the environment variable `NAME` when it's set and not blank. Locally that's `.env`, or `docker-compose.yml` for `DATABASE_URL`. An empty line in `.env`, such as `ANTHROPIC_API_KEY=`, counts as unset.
-- Otherwise it reads the SSM SecureString parameter that `NAME_SSM` names. That's how the Lambda function gets them (M5).
+- Otherwise it reads the SSM SecureString parameter that `NAME_SSM` names. That's how the Lambda function gets them, and how `make migrate-prod` and `make report-prod` get Neon's URL.
 
 `ALPACA_PAPER` must be `true` (the default when unset) or `false`. Anything else stops the app, so a typo can't point it at a live account.
 

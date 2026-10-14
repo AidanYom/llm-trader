@@ -1,7 +1,8 @@
 """Alembic's entry point (HANDOFF §10): runs the migrations against the database DATABASE_URL names.
 
-The integration tests hand over their own connection in `config.attributes["connection"]` instead, so they
-can migrate the test database inside a transaction.
+Like the app, it reads DATABASE_URL through Secrets, so `make migrate-prod` can leave it blank and name the
+SSM parameter holding Neon's URL in DATABASE_URL_SSM instead. The integration tests hand over their own
+connection in `config.attributes["connection"]`, so they can migrate the test database inside a transaction.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from sqlalchemy import Connection
 
 from trader.db.engine import make_engine
 from trader.db.tables import metadata
+from trader.settings import SecretError, Secrets
 
 config = context.config
 
@@ -47,10 +49,10 @@ def migrate(connection: Connection) -> None:
 
 
 def database_url() -> str:
-    url = os.environ.get("DATABASE_URL")
-    if not url:
-        raise SystemExit("DATABASE_URL is not set: it names the database to migrate")
-    return url
+    try:
+        return Secrets(os.environ).get("DATABASE_URL")
+    except SecretError as exc:  # a one-line message, not a traceback
+        raise SystemExit(f"can't migrate: {exc}") from None
 
 
 main()

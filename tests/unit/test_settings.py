@@ -349,6 +349,23 @@ def test_ssm_failure_names_the_parameter() -> None:
         secrets.get("DATABASE_URL")
 
 
+def test_an_ssm_client_that_cant_be_built_is_a_secret_error() -> None:
+    """boto3 raises when building the client if, say, the AWS profile doesn't exist."""
+
+    def no_profile() -> SsmClient:
+        raise LookupError("The config profile (llm-trader) could not be found")
+
+    secrets = Secrets({"DATABASE_URL_SSM": "/llm-trader/DATABASE_URL"}, ssm=no_profile)
+
+    with pytest.raises(SecretError) as exc_info:
+        secrets.get("DATABASE_URL")
+
+    assert str(exc_info.value) == (
+        "DATABASE_URL: can't read SSM parameter /llm-trader/DATABASE_URL: "
+        "LookupError: The config profile (llm-trader) could not be found"
+    )
+
+
 def test_empty_ssm_parameter_is_refused() -> None:
     secrets = Secrets({"DATABASE_URL_SSM": "/p"}, ssm=lambda: FakeSsm({"/p": " "}))
 
