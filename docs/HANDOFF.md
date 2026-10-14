@@ -516,12 +516,12 @@ Everything runs in Docker; nothing uses the host's Python.
   - `TEST_DATABASE_URL=postgresql+psycopg://trader:trader@db:5432/trader_test`
   - `depends_on` the database being healthy
 - `prod` (added in milestone 5, under the `ops` profile so `docker compose up` never starts it): `app` pointed at production's Neon database, for `make migrate-prod` and `make report-prod`.
-  - `~/.aws` mounted read-only, with `AWS_PROFILE` (default `llm-trader`) and `AWS_REGION=us-east-1`
+  - `~/.aws` mounted, with `AWS_PROFILE` (default `llm-trader`) and `AWS_REGION=us-east-1`
   - `DATABASE_URL` blank and `DATABASE_URL_SSM=/llm-trader/DATABASE_URL`, so `Secrets` reads Neon's URL from SSM inside the container. It never goes in `.env`, on a command line or in make's output.
   - no dependency on the local database
 - `terraform` and `aws` (added in milestone 5, also under `ops`): the pinned images from section 12, with `AWS_PROFILE` (default `llm-trader`) and `AWS_REGION=us-east-1`.
-  - `terraform` mounts `infra/`, keeps `infra/.terraform` (providers and backend settings) in a named volume, and mounts `~/.aws` read-only.
-  - `aws` mounts `~/.aws` writable, because `aws configure` and `aws sso login` save there.
+  - `terraform` mounts `infra/`, and keeps `infra/.terraform` (providers and backend settings) in a named volume.
+  - All three mount `~/.aws` writable. `aws configure` and `aws sso login` save there, and an IAM Identity Center login's tokens renew about hourly: Terraform and boto3 write each renewal back, and fail if they can't.
 
 **Makefile** (each target is a one-line `docker compose` command; on Windows, run `make` from WSL2 or Git Bash with make installed):
 - `build`, `up`, `down`, `shell`, `psql`

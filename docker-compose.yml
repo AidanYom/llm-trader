@@ -51,7 +51,7 @@ services:
       AWS_PROFILE: ${AWS_PROFILE:-llm-trader}
       AWS_REGION: us-east-1
     volumes:
-      - ~/.aws:/root/.aws:ro
+      - ~/.aws:/root/.aws # writable: an IAM Identity Center login's tokens renew hourly and are saved here
     depends_on: !reset []
 
   # Terraform and the AWS CLI, pinned (HANDOFF §12): make tf, plan, deploy, aws, secret, invoke and logs. Both
@@ -63,7 +63,7 @@ services:
     volumes:
       - ./infra:/infra
       - terraform:/infra/.terraform # providers and backend settings, kept off the slow Windows bind mount
-      - ~/.aws:/root/.aws:ro
+      - ~/.aws:/root/.aws # writable: an IAM Identity Center login's tokens renew hourly and are saved here
     environment:
       AWS_PROFILE: ${AWS_PROFILE:-llm-trader}
       AWS_REGION: us-east-1
