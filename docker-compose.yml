@@ -1,9 +1,9 @@
-# Local development: Postgres 16 plus the dev tooling image (HANDOFF §13).
+# Local development: Postgres 18 plus the dev tooling image (HANDOFF §13).
 name: llm-trader
 
 services:
   db:
-    image: postgres:16
+    image: postgres:18
     environment:
       POSTGRES_USER: trader
       POSTGRES_PASSWORD: trader
@@ -11,7 +11,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql # from Postgres 18 the image keeps its data in a versioned folder under this
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # Check over TCP: during first-time setup Postgres listens only on its socket,
