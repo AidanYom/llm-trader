@@ -2,4 +2,4 @@
 # isn't here: it goes in the gitignored local.auto.tfvars (copy local.auto.tfvars.example).
 
 # dry_run: scheduled runs call Claude and record orders but send none. submit: they send paper orders.
-run_mode = "dry_run"
+run_mode = "submit"
