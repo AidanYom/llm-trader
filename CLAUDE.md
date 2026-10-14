@@ -74,7 +74,7 @@ Keep this section current: update it in the pull request that completes each mil
 | `src/trader/lambda_handler.py` | Lambda entry point | Thin wrapper over `run_daily` |
 | `config/` | `policy.yaml`, `strategy.yaml`, `system_frame.md`, `strategy.md` | Aidan owns `policy.yaml` values and `strategy.md` |
 | `migrations/` | Alembic | See the database rules below |
-| `infra/` | Terraform (M5) | No secret values in Terraform |
+| `infra/` | Terraform (M5) | No secret values in Terraform; Aidan's alarm email stays in the gitignored `local.auto.tfvars` |
 
 ## Commands
 
@@ -96,6 +96,16 @@ make dry-run      # real Alpaca + Claude, no orders (needs .env keys)
 make submit       # real paper orders
 make report       # weekly markdown → reports/ (ARGS=--offline for offline runs)
 make smoke        # read-only Alpaca check
+make image        # build the Lambda image and check it offline
+make migrate-prod # alembic upgrade head against Neon (reads its URL from SSM with your AWS credentials)
+make report-prod  # weekly report from Neon (ARGS as for make report)
+make tf ARGS=…    # Terraform in its pinned container (make tf ARGS=init first)
+make aws ARGS=…   # the AWS CLI in its pinned container
+make secret name=X  # store an SSM SecureString /llm-trader/X, prompting without echo
+make plan         # what make deploy would change (free)
+make deploy       # push the image tagged with the commit, then terraform apply (costs: AWS resources)
+make invoke payload='{"mode":"dry_run"}'  # invoke the Lambda now (dry_run and submit call Claude: costs money)
+make logs         # follow the Lambda's logs
 ```
 
 Before asking for review, `make lint && make test` must pass locally, and CI must be green.
@@ -160,4 +170,8 @@ Before asking for review, `make lint && make test` must pass locally, and CI mus
   - Bracket and OTO legs only persist with GTC.
   - Alpaca cancels GTC orders after 90 days.
 - **Paper fills** aren't checked against real liquidity, so paper results for small caps look better than live ones would.
+- **Lambda:**
+  - Build images with `--provenance=false`; Lambda refuses the image index Docker's default attestation creates.
+  - Invoke with `make invoke`, which is asynchronous. A synchronous `aws lambda invoke` times out after 60 s by default, and the CLI then retries it, starting a second run.
+  - EventBridge Scheduler invokes asynchronously, so Lambda's own retries apply; Terraform turns them off.
 - **The Anthropic tool loop** re-sends the conversation every turn. Keep the cache breakpoints on the system prompt and the briefing, and log usage including cache read and write tokens.

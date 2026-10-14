@@ -1,9 +1,9 @@
-# Local development: Postgres 16 plus the dev tooling image (HANDOFF §13).
+# Local development: Postgres 18 plus the dev tooling image (HANDOFF §13).
 name: llm-trader
 
 services:
   db:
-    image: postgres:16
+    image: postgres:18
     environment:
       POSTGRES_USER: trader
       POSTGRES_PASSWORD: trader
@@ -11,7 +11,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql # from Postgres 18 the image keeps its data in a versioned folder under this
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # Check over TCP: during first-time setup Postgres listens only on its socket,
@@ -38,5 +38,45 @@ services:
       db:
         condition: service_healthy
 
+  # The app against production's Neon database: make migrate-prod and make report-prod (HANDOFF §16).
+  # DATABASE_URL is blank, so Secrets reads Neon's URL from SSM with your AWS credentials: it never goes in
+  # .env, on a command line or in make's output. The ops profile keeps `docker compose up` from starting it.
+  prod:
+    extends: app
+    profiles: [ops]
+    environment:
+      DATABASE_URL: ""
+      DATABASE_URL_SSM: /llm-trader/DATABASE_URL
+      TEST_DATABASE_URL: "" # tests never run against production
+      AWS_PROFILE: ${AWS_PROFILE:-llm-trader}
+      AWS_REGION: us-east-1
+    volumes:
+      - ~/.aws:/root/.aws # writable: an IAM Identity Center login's tokens renew hourly and are saved here
+    depends_on: !reset []
+
+  # Terraform and the AWS CLI, pinned (HANDOFF §12): make tf, plan, deploy, aws, secret, invoke and logs. Both
+  # use your AWS credentials from ~/.aws. The Terraform version is pinned in .github/workflows/ci.yml too.
+  terraform:
+    image: hashicorp/terraform:1.16.4
+    profiles: [ops]
+    working_dir: /infra
+    volumes:
+      - ./infra:/infra
+      - terraform:/infra/.terraform # providers and backend settings, kept off the slow Windows bind mount
+      - ~/.aws:/root/.aws # writable: an IAM Identity Center login's tokens renew hourly and are saved here
+    environment:
+      AWS_PROFILE: ${AWS_PROFILE:-llm-trader}
+      AWS_REGION: us-east-1
+
+  aws:
+    image: amazon/aws-cli:2.37.4
+    profiles: [ops]
+    volumes:
+      - ~/.aws:/root/.aws # writable: aws configure and aws sso login save settings and tokens here
+    environment:
+      AWS_PROFILE: ${AWS_PROFILE:-llm-trader}
+      AWS_REGION: us-east-1
+
 volumes:
   pgdata:
+  terraform:

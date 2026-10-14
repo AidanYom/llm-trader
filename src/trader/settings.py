@@ -113,9 +113,9 @@ class Secrets:
             raise SecretError(
                 f"{name} is not set: set it in .env, or set {name}_SSM to an SSM parameter name"
             )
-        if self._ssm is None:
-            self._ssm = self._make_ssm()
         try:
+            if self._ssm is None:  # building the client fails too, for example on an unknown AWS profile
+                self._ssm = self._make_ssm()
             value = self._ssm.get_parameter(Name=parameter, WithDecryption=True)["Parameter"]["Value"]
         except Exception as exc:  # whatever failed, the secret is unavailable
             # boto3's error messages name the parameter and the error code, never the value.

@@ -291,7 +291,7 @@ Offline runs are excluded from risk-context queries and from reports.
 
 ## 10. Database
 
-- **Engine:** PostgreSQL 16 everywhere: local Compose, CI service container, and Neon in production.
+- **Engine:** PostgreSQL 18 everywhere: local Compose, CI service container, and Neon in production.
 - **Access:** SQLAlchemy 2.0 **Core** (table objects plus a small repository module of explicit functions; no ORM) with the `psycopg` 3 driver (`postgresql+psycopg://`).
 - **Migrations:** Alembic.
   - Every schema change is a reviewed migration with a working `downgrade`.
@@ -452,6 +452,7 @@ Aidan reads the report in his Claude Project. The bot never uses MCP. For ad-hoc
 - **Packages:** **uv** with `pyproject.toml` and a committed `uv.lock`. Use a src layout and expose a `trader` console script.
 - **Runtime dependencies:** `alpaca-py`, `anthropic`, `sqlalchemy>=2`, `alembic`, `psycopg[binary]>=3`, `pyyaml`, `boto3`.
 - **Dev dependencies:** `pytest`, `ruff`, `mypy` (strict type checking, added in M1), and `types-PyYAML` (PyYAML's type hints for mypy).
+- **Infrastructure tools** (added in M5): pinned Docker images, run through make and never installed on the host. `hashicorp/terraform:1.16.4`, with the `hashicorp/aws` provider `~> 6.66` pinned by the committed `infra/.terraform.lock.hcl`, and `amazon/aws-cli:2.37.4`.
 - **CLI:** argparse subcommands: `trader run --mode … [--force] [--show-briefing]`, `trader report [--days N] [--no-baseline] [--offline]`, `trader smoke`.
 - **Default branch:** `main`. Rename the empty `master` before the first commit.
 - **`.gitattributes`:** `* text=auto eol=lf`. The repo lives on Windows and must stay LF for the Linux containers.
@@ -504,13 +505,13 @@ Everything runs in Docker; nothing uses the host's Python.
 
 **Dockerfile targets:**
 - `dev`: `python:3.12-slim` plus uv (copied from the official uv image). `uv sync --frozen` installs dev dependencies into `/app/.venv`, which goes on `PATH`.
-- `lambda`: `public.ecr.aws/lambda/python:3.12`. Runtime dependencies come from `uv export --frozen --no-dev` into `${LAMBDA_TASK_ROOT}`, then `src/trader` and `config/` are copied in. `CMD ["trader.lambda_handler.handler"]`. Built with `--platform linux/amd64`.
+- `lambda`: `public.ecr.aws/lambda/python:3.12`. Runtime dependencies come from `uv export --frozen --no-dev` into `${LAMBDA_TASK_ROOT}`, then `src/trader` and `config/` are copied in. `CMD ["trader.lambda_handler.handler"]`. Built with `--platform linux/amd64` and `--provenance=false`: Lambda refuses the image index that Docker's default provenance attestation creates.
 
 **docker-compose.yml:**
 - `db`:
-  - `postgres:16`, with user, password and database all set to `trader`
+  - `postgres:18`, with user, password and database all set to `trader`
   - port 5432 published
-  - named volume `pgdata`
+  - named volume `pgdata`, mounted at `/var/lib/postgresql`: from 18 the image keeps its data in a versioned folder under it (`18/docker`)
   - `docker/initdb` mounted to create `trader_test`
   - `pg_isready` healthcheck
 - `app`:
@@ -520,13 +521,29 @@ Everything runs in Docker; nothing uses the host's Python.
   - `DATABASE_URL=postgresql+psycopg://trader:trader@db:5432/trader`
   - `TEST_DATABASE_URL=postgresql+psycopg://trader:trader@db:5432/trader_test`
   - `depends_on` the database being healthy
+- `prod` (added in milestone 5, under the `ops` profile so `docker compose up` never starts it): `app` pointed at production's Neon database, for `make migrate-prod` and `make report-prod`.
+  - `~/.aws` mounted, with `AWS_PROFILE` (default `llm-trader`) and `AWS_REGION=us-east-1`
+  - `DATABASE_URL` blank and `DATABASE_URL_SSM=/llm-trader/DATABASE_URL`, so `Secrets` reads Neon's URL from SSM inside the container. It never goes in `.env`, on a command line or in make's output.
+  - no dependency on the local database
+- `terraform` and `aws` (added in milestone 5, also under `ops`): the pinned images from section 12, with `AWS_PROFILE` (default `llm-trader`) and `AWS_REGION=us-east-1`.
+  - `terraform` mounts `infra/`, and keeps `infra/.terraform` (providers and backend settings) in a named volume.
+  - All three mount `~/.aws` writable. `aws configure` and `aws sso login` save there, and an IAM Identity Center login's tokens renew about hourly: Terraform and boto3 write each renewal back, and fail if they can't.
 
 **Makefile** (each target is a one-line `docker compose` command; on Windows, run `make` from WSL2 or Git Bash with make installed):
 - `build`, `up`, `down`, `shell`, `psql`
 - `lint` (`ruff check` + `ruff format --check` + `mypy`), `fmt`, `test`
 - `migrate` (`alembic upgrade head`), `revision m="…"` (autogenerate)
 - `offline`, `dry-run`, `submit`, `report`, `smoke`, each passing `ARGS=…` to the command, for example `make report ARGS=--offline`
-- added in milestone 5: `image`, `push`, `deploy`, `migrate-prod`
+- added in milestone 5:
+  - `image`: build the `lambda` image tagged with the short git SHA, then check it with no network (section 15)
+  - `migrate-prod` and `report-prod`: `alembic upgrade head` and `trader report` through the `prod` service
+  - `tf` and `aws`: Terraform and the AWS CLI in their containers, passing `ARGS`
+  - `secret name=X`: prompts for a value without echoing it and stores it as the SSM SecureString `/llm-trader/X`
+  - `push`: refuses uncommitted changes (the image's tag is the commit), runs `image`, and pushes to ECR unless that tag is already there
+  - `plan` and `deploy`: `terraform plan`, or `push` then `terraform apply`, with `-var image_tag=<short SHA>`
+  - `invoke payload='…'`: invokes the function asynchronously, as the schedule does. A synchronous `aws lambda invoke` would time out after the CLI's 60 s and be retried, starting a second run.
+  - `logs`: follows the function's log group
+- The Makefile exports `MSYS_NO_PATHCONV=1`, so Git Bash passes path-like arguments to Docker unchanged.
 
 **Config paths** (`config/policy.yaml`, `config/strategy.yaml`, and the prompt paths inside it) are relative to the working directory: `/app` in the dev container, `/var/task` in the Lambda image.
 
@@ -575,56 +592,74 @@ Everything runs in Docker; nothing uses the host's Python.
 `.github/workflows/ci.yml` runs on pushes to any branch and on pull requests to `main`, with concurrency that cancels superseded runs on the same ref.
 
 - **Job `test`** (ubuntu-latest):
-  1. Start a `postgres:16` service container with a health check.
+  1. Start a `postgres:18` service container with a health check.
   2. `astral-sh/setup-uv` with caching, then `uv sync --frozen`.
   3. `ruff check .`, `ruff format --check .` and `mypy`.
   4. `alembic upgrade head` and `alembic check` (schema drift fails the build).
   5. `pytest -q`.
-- **Job `image`:** `docker build --platform linux/amd64 --target lambda .`, with no push.
+- **Job `image`:** `docker build --platform linux/amd64 --provenance=false --target lambda .`, with no push. Then `docker/lambda_check.py` runs inside the image with no network: it imports the handler the image's CMD names, checks the time-zone data and psycopg's bundled libpq, and invokes the handler with no secrets. `config/` must load and the first secret must be missing.
+- **Job `terraform`** (added in M5): in the pinned Terraform image, `terraform fmt -check -recursive`, `terraform init -backend=false -lockfile=readonly` and `terraform validate`. It uses no backend and no AWS credentials, so it checks the configuration, never the real resources.
 
-`main` is protected: merges require a pull request with both jobs green. Private repos on GitHub Free get 2,000 Actions minutes a month, which is far more than this needs.
+`main` is protected: merges require a pull request with every job green. Aidan adds `terraform` to the required checks. Private repos on GitHub Free get 2,000 Actions minutes a month, which is far more than this needs.
 
 ## 16. Production
 
 **Region:** AWS `us-east-1`.
 
 **Database:** Neon free plan (100 compute-hours a month per project, scales to zero after 5 idle minutes, 0.5 GB storage).
-- Create one Neon project on Postgres 16 in the AWS us-east-1 region, with database `trader`.
-- The connection string (with `sslmode=require`) goes into SSM.
+- Create one Neon project on Postgres 18 in the AWS us-east-1 region, with database `trader`.
+- The connection string (with `sslmode=require`) goes into SSM. Use the direct connection, with Neon's connection pooling off: a pooler adds nothing for one connection a day. The engine is built per invocation, and `pool_pre_ping` replaces a connection Neon dropped while Claude was working, so no pooling change is needed (no `NullPool`).
 
-**Secrets** are SSM SecureString parameters. Create them by hand with the AWS CLI so the values never enter Terraform state:
+**Secrets** are SSM SecureString parameters. Create them by hand with `make secret name=…`, which prompts without echoing, so the values never enter Terraform state, git or shell history:
 - `/llm-trader/ALPACA_API_KEY`
 - `/llm-trader/ALPACA_SECRET_KEY`
 - `/llm-trader/ANTHROPIC_API_KEY`
 - `/llm-trader/DATABASE_URL`
 
+The Lambda's Anthropic key is its own, created for it in the llm-trader workspace, so it can be revoked without touching the local one. Anthropic supports workload identity federation, which could replace the static key with short-lived credentials for the function's IAM role; it's deferred past M5.
+
 **Terraform** (`infra/`):
-- **State:** S3 backend (a bucket created once by hand) with `use_lockfile = true` and encryption on.
+- **State:** S3 backend with `use_lockfile = true` and encryption on. The bucket, `llm-trader-tfstate-7fc29959`, is created once by hand with versioning on; its random suffix keeps the account ID out of git.
+- **Settings:** `infra/terraform.tfvars` is committed and holds `run_mode`, so a deploy can't quietly change it: a `-var` flag would have to be repeated on every deploy, or the default would come back. `alert_email` goes in the gitignored `infra/local.auto.tfvars` (from the committed `.example`), because Aidan keeps his email out of git.
 - **Resources:**
-  - An ECR repository with scan-on-push, and a lifecycle policy keeping the last 10 images.
-  - A Lambda IAM role with `AWSLambdaBasicExecutionRole`, `ssm:GetParameter` on `arn:aws:ssm:us-east-1:<account>:parameter/llm-trader/*`, and `kms:Decrypt` for the `aws/ssm` key.
+  - An ECR repository with scan-on-push, immutable tags and a lifecycle policy keeping the last 10 images. A tag is the commit an image was built from, and Lambda pins a tag to its digest at deploy, so a tag must always mean the same image.
+  - A Lambda IAM role with `AWSLambdaBasicExecutionRole`, `ssm:GetParameter` on `arn:aws:ssm:us-east-1:<account>:parameter/llm-trader/*`, and `kms:Decrypt` for the `aws/ssm` key. AWS creates that key with the account's first SecureString parameter, so the secrets come before the first full apply.
   - The Lambda function `llm-trader`:
     - `package_type = Image`, `image_uri = <ecr>:<var.image_tag>`, x86_64
-    - 512 MB memory, 300 s timeout
-    - environment: `RUN_MODE` (from `var.run_mode`, default `dry_run`), `LOG_LEVEL`, and the four `*_SSM` parameter names
-  - A CloudWatch log group `/aws/lambda/llm-trader` with 30-day retention.
+    - 512 MB memory and a 900 s timeout, Lambda's maximum. One Claude turn can take 6 minutes (120 s, retried twice), and a submit run killed by the timeout stays `running` until `force`. Lambda bills the time used, not the limit, and 15 minutes stays under `--force`'s 20-minute threshold.
+    - environment: `RUN_MODE` (from `var.run_mode`, default `dry_run`), `LOG_LEVEL`, `ALPACA_PAPER=true`, and the four `*_SSM` parameter names. `ALPACA_PAPER` is set in the file so going live is a reviewed change (section 19).
+    - no VPC, which would need a NAT gateway at about $30 a month to reach Alpaca and Claude
+    - asynchronous invocations: 0 retries and a 30-minute maximum event age. EventBridge Scheduler invokes asynchronously, and by default Lambda retries a failed asynchronous invocation twice. A failed submit run doesn't hold the day's unique index, so a retry could trade a second time. A run Lambda had to queue is dropped after 30 minutes, so it never starts after the open.
+  - A CloudWatch log group `/aws/lambda/llm-trader` with 30-day retention, created before the function.
   - An EventBridge Scheduler schedule:
     - `cron(31 8 ? * MON-FRI *)` in `America/New_York`
-    - flexible time window off, retry attempts 0
-    - an invoke role scoped to the function
-  - An SNS topic with an email subscription (`var.alert_email`), and a CloudWatch alarm on the function's `Errors` metric (≥ 1 in a day) that notifies it.
+    - flexible time window off, retry attempts 0, and an empty input, so `RUN_MODE` decides the mode
+    - an invoke role trusted only by the Scheduler in this account, scoped to the function
+  - An SNS topic with an email subscription (`var.alert_email`) that Aidan confirms once from the email, and three emails:
+    - `llm-trader-errors`: the function's `Errors` metric, sum ≥ 1 over 5 minutes, missing data treated as OK. Any failed invocation emails within minutes, and the alarm resets itself, so the next failure emails again.
+    - `llm-trader-error-logs`: a metric filter counts JSON log lines with `level` ERROR, except `run failed`, which the first alarm covers. So a completed run that logged an error emails too, such as an order Alpaca refused (a wash-trade 403 included) or a partially filled entry whose stop couldn't be re-placed. It matches the level, not the wording, so rewording a message can't silently disable it.
+    - An AWS budget for the whole account, $5 a month (`var.monthly_budget_usd`), emailing `alert_email` when actual or forecast spend passes it.
 
 **Deploy and migrations:**
-- `make deploy`: build the `lambda` image tagged with the short git SHA, push it to ECR, then `terraform apply -var image_tag=<sha>`.
-- `make migrate-prod`: run `alembic upgrade head` in the dev container against Neon. Run it before deploying any image that needs a new schema; the startup schema check enforces this.
+- `make deploy`: build the `lambda` image tagged with the short git SHA, push it to ECR, then `terraform apply -var image_tag=<sha>`, which shows the plan and asks first. It refuses uncommitted changes, since the tag must describe the image, and skips a push when that tag is already in ECR.
+- The first deploy needs the ECR repository before the image can be pushed, so it's created alone once: `make tf ARGS="apply -target=aws_ecr_repository.trader -var image_tag=none"`.
+- `make migrate-prod`: run `alembic upgrade head` in the dev container against Neon, through the `prod` Compose service (section 13). Alembic's `env.py` reads `DATABASE_URL` through `Secrets`, like the app, so it can come from SSM. Run it before deploying any image that needs a new schema; the startup schema check enforces this.
+- `make report-prod`: the weekly report (section 11) against Neon, the same way. Production's runs live there, so `make report`, which reads the dev database, can't see them.
+- Once production runs, don't run `make submit` locally. It records to the dev database, where the one-submit-run-per-day index can't see the Lambda's run, so both could trade on the same day. `make dry-run` never sends orders.
 
 **Lambda handler** (`trader.lambda_handler.handler`):
-- Mode comes from `event["mode"]` or `RUN_MODE`, and must be `dry_run` or `submit`.
-- Resolve secrets, run `run_daily`, and return `{run_id, status, summary}`.
+- Mode comes from `event["mode"]` or `RUN_MODE`, and must be `dry_run` or `submit`. A missing, null or empty `mode` in the event falls back to `RUN_MODE`. Any other value fails before a secret is read or Claude is called, so invoking `{"mode": "bogus"}` is a free way to test the alarm.
+- `event["force"]`, true or false (default false), first abandons the day's stale `running` submit run, as `--force` does (section 9). A run stuck `running` after a Lambda timeout can then be retried from the Lambda instead of locally.
+- Resolve secrets once per execution environment, so warm invocations reuse them. Build the database engine per invocation and dispose of it afterwards. Run `run_daily`, and return `{run_id, status, summary}` as strings.
+- A failed run re-raises, so the invocation fails and the function's `Errors` alarm counts it.
 
-**Rollout:** deploy with `run_mode = dry_run`, review about a week of briefings and verdicts, then apply `run_mode = submit`.
+**Rollout:** Aidan dropped the week of dry-run review; no dry runs happened in M4 either.
+1. Deploy with `run_mode = dry_run`.
+2. Test the alarm with `{"mode": "bogus"}`. That's free: it fails before any secret is read or Claude is called.
+3. Invoke one dry run by hand, on a trading day, and check its logs and summary. It's the first real Claude call, so it also tests the agent loop against the API.
+4. Set `run_mode = submit` in `infra/terraform.tfvars` and deploy. That needs the re-placed stops for partially filled entries (section 8) merged first.
 
-**Expected running cost:** about $4 a month for Claude. Lambda, Scheduler, SSM, ECR and CloudWatch come to about $0–1. Neon and GitHub Actions stay within their free tiers. The Anthropic Console balance is prepaid with auto-reload off, which caps spend.
+**Expected running cost:** about $4 a month for Claude, whether runs are dry runs or submit runs. Lambda, Scheduler, SSM, ECR, CloudWatch and SNS come to a few cents, well within $0–1, and the budget emails past $5. Neon and GitHub Actions stay within their free tiers. The Anthropic Console balance is prepaid with auto-reload off, which caps spend.
 
 ## 17. Configuration reference
 
@@ -648,8 +683,8 @@ Build in this order, one branch and pull request per milestone. Post a short pla
   - `make report ARGS=--offline` renders from it (reports leave out offline runs unless asked, section 11)
   - the full test list passes
 - **M4: Real services, local.** `brokers/alpaca.py`, the Anthropic client wiring, and `smoke.py`. M4 also rejects buys of leveraged and inverse ETFs by their Alpaca asset name, because `blocked_symbols` can't list every such product; the name patterns become a new policy setting that Aidan approves. Aidan adds keys and runs `make smoke`. Fix any adapter mismatches the smoke command finds. **Done when:** smoke passes, including its check of the name patterns against Alpaca's names. Aidan dropped the planned dry runs: the first real runs are paper `submit` runs in Lambda (M5).
-- **M5: Production.** The Lambda image target, `infra/` Terraform, the Neon project, SSM parameters, `make deploy` and `migrate-prod`, and the error alarm. **Done when:**
-  - the scheduled Lambda completes a dry run against Neon
+- **M5: Production.** The Lambda handler and image, `infra/` Terraform, the Neon project, SSM parameters, `make deploy`, `migrate-prod` and `report-prod`, the alarms, and re-placed stops for partially filled entries (the decision §20 left to M5). **Done when:**
+  - the scheduled Lambda completes a run against Neon. Aidan dropped the week of dry runs: one dry run invoked by hand checks the plumbing, then production switches to submit (section 16).
   - a forced error sends the alarm email
   - switching `run_mode` to `submit` places paper orders
 

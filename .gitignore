@@ -24,6 +24,8 @@ reports/
 *.tfstate
 *.tfstate.*
 *.tfplan
+# Personal settings such as the alarm email, which stay out of git (see infra/local.auto.tfvars.example)
+infra/local.auto.tfvars
 
 # OS and editors
 .DS_Store
