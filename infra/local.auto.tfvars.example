@@ -1,0 +1,3 @@
+# Copy to local.auto.tfvars (gitignored), which Terraform reads automatically, and fill in your address.
+# AWS emails it a confirmation link on the first deploy; the alarms reach it only once the link is clicked.
+alert_email = "you@example.com"
