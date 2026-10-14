@@ -22,9 +22,12 @@ class BrokerError(RuntimeError):
 class CancelledOrder:
     broker_order_id: str
     symbol: str
-    # Shares the order had bought before it was cancelled. A cancelled entry's legs go with it, so these are
-    # left with no stop (HANDOFF §8 and §20).
+    # Shares the entry had bought when its cancel landed. Its legs are cancelled with it, so run.py re-places
+    # the stop for these shares (HANDOFF §8).
     filled_qty: float = 0.0
+    # False if the cancel still hadn't landed when the wait ran out. Until it does, the entry's legs hold the
+    # shares, so no stop can be placed for them yet.
+    landed: bool = True
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -83,7 +86,12 @@ class Broker(Protocol):
         """
 
     def cancel_open_buy_orders(self) -> list[CancelledOrder]:
-        """Cancel every open BUY order: earlier runs' unfilled entries. An entry's legs go with it."""
+        """Cancel every open BUY order, earlier runs' unfilled entries, and wait for the cancels to land.
+
+        An entry's legs go with it. Each cancelled entry comes back with the shares it had filled when its
+        cancel landed, or with `landed` false if the wait ran out first (8 s for Alpaca, HANDOFF §8). An entry
+        that filled completely before its cancel landed keeps its legs, so it isn't returned.
+        """
 
     def cancel_open_orders(self, symbol: str) -> list[str]:
         """Cancel every open order for the symbol, and return their IDs once every cancel has landed.
@@ -93,7 +101,8 @@ class Broker(Protocol):
         """
 
     def submit(self, order: Order, client_order_id: str) -> SubmittedOrder:
-        """Send the order: a limit buy with its protective legs, or a market sell of a whole position.
+        """Send the order: a limit buy with its protective legs, a market sell of a whole position, or a
+        protective stop on its own, good until cancelled.
 
         Raises BrokerError if the broker refuses it, for example for a client_order_id it has already seen.
         """

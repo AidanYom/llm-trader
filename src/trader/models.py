@@ -169,7 +169,8 @@ class Proposal:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Order:
-    """An order for the broker: a limit buy with a protective stop, or a full exit at market."""
+    """An order for the broker: a limit buy with a protective stop, a full exit at market, or a stop on its
+    own, for the shares of a partially filled entry whose legs were cancelled with it (HANDOFF §8)."""
 
     symbol: str
     side: Side
@@ -184,10 +185,15 @@ class Order:
             raise ValueError("an order needs a symbol")
         if isinstance(self.qty, bool) or not isinstance(self.qty, int) or self.qty < 1:
             raise ValueError(f"{self.symbol}: qty must be a whole number of shares >= 1, got {self.qty!r}")
-        prices = (self.limit_price, self.stop_price, self.take_profit_price)
         if self.side == Side.SELL:
-            if any(price is not None for price in prices):
-                raise ValueError(f"{self.symbol}: a sell is a full exit at market and takes no prices")
+            if self.limit_price is not None or self.take_profit_price is not None:
+                raise ValueError(
+                    f"{self.symbol}: a sell is a full exit at market or a protective stop, so it takes no "
+                    "limit or take-profit price"
+                )
+            stop = to_cents(self.stop_price)
+            if self.stop_price is not None and (stop is None or stop < 1):
+                raise ValueError(f"{self.symbol}: the stop {self.stop_price!r} must be at least $0.01")
             return
         if self.side != Side.BUY:
             raise ValueError(f"{self.symbol}: side must be buy or sell, got {self.side!r}")
@@ -207,6 +213,11 @@ class Order:
                     f"{self.symbol}: the take-profit {self.take_profit_price!r} must be above the limit "
                     f"{self.limit_price!r}"
                 )
+
+    @property
+    def is_stop(self) -> bool:
+        """A protective stop on its own: a sell with a stop price, rather than a full exit at market."""
+        return self.side == Side.SELL and self.stop_price is not None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

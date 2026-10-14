@@ -355,6 +355,32 @@ def test_a_client_order_id_can_be_submitted_twice(conn: Connection, run_id: UUID
     assert conn.execute(select(func.count()).select_from(orders)).scalar_one() == 2
 
 
+def test_entry_order_finds_only_the_submitted_buy_with_that_broker_id(conn: Connection, run_id: UUID) -> None:
+    """A run re-places a partially filled entry's stop at this price, against this proposal (HANDOFF §8)."""
+    entry_id = record_decision(conn, run_id, ENTRY)
+    exit_id = record_decision(conn, run_id, EXIT, seq=1)
+    for proposal_id, order, status, broker_order_id in [
+        (entry_id, ENTRY, OrderStatus.SUBMITTED, "b-entry"),
+        (exit_id, EXIT, OrderStatus.SUBMITTED, "b-exit"),
+        (entry_id, ENTRY, OrderStatus.ERROR, "b-refused"),  # the broker never had it
+    ]:
+        repo.record_order(
+            conn,
+            run_id,
+            proposal_id=proposal_id,
+            client_order_id=f"llmt-2026-09-28-{order.symbol}-{order.side.value}",
+            order=order,
+            opens_new_position=order.side == Side.BUY,
+            status=status,
+            broker_order_id=broker_order_id,
+        )
+
+    assert repo.entry_order(conn, "b-entry") == repo.EntryOrder(proposal_id=entry_id, stop_price=87.4)
+    assert repo.entry_order(conn, "b-exit") is None  # a sell isn't an entry
+    assert repo.entry_order(conn, "b-refused") is None
+    assert repo.entry_order(conn, "b-unknown") is None
+
+
 def test_cancelled_orders_may_lack_a_symbol(conn: Connection, run_id: UUID) -> None:
     repo.record_cancelled_order(
         conn, run_id, broker_order_id="b-1", symbol=None, reason=CancelReason.STALE_ENTRY

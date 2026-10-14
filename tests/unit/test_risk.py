@@ -21,7 +21,7 @@ from trader.models import (
     Verdict,
     VerdictStatus,
 )
-from trader.risk import blocked_pattern, drawdown_pct, evaluate, freeze_active
+from trader.risk import blocked_pattern, drawdown_pct, evaluate, freeze_active, restored_stop
 
 APPROVED, TRIMMED, REJECTED = VerdictStatus.APPROVED, VerdictStatus.TRIMMED, VerdictStatus.REJECTED
 
@@ -715,3 +715,37 @@ def test_drawdown_exactly_at_freeze_limit_is_not_frozen() -> None:
     assert not freeze_active(75_000, 100_000, policy)
     assert freeze_active(74_999, 100_000, policy)
     assert drawdown_pct(120_000, 100_000) == 0.0  # a new high is the peak
+
+
+# --- The stop re-placed for a cancelled, partially filled entry's shares (HANDOFF §8) ---
+
+
+def test_a_restored_stop_sells_the_filled_whole_shares_at_the_approved_stop() -> None:
+    stop = restored_stop("XLK", 4.0, 180.57)
+
+    assert stop == Order(symbol="XLK", side=Side.SELL, qty=4, stop_price=180.57)
+    assert stop is not None and stop.is_stop
+    assert restored_stop("XLK", 4.9, 180.57) == stop  # whole shares: a fraction stays unprotected
+
+
+def test_a_restored_stop_keeps_the_stop_in_whole_cents() -> None:
+    stop = restored_stop("XLK", 2.0, 180.574999)
+
+    assert stop is not None and stop.stop_price == 180.57
+
+
+@pytest.mark.parametrize(
+    ("filled_qty", "stop_price"),
+    [
+        (0.0, 180.57),
+        (0.9, 180.57),  # no whole share
+        (math.nan, 180.57),
+        (4.0, None),  # no recorded stop
+        (4.0, math.nan),
+        (4.0, 0.004),  # under a cent
+    ],
+)
+def test_no_stop_is_restored_without_a_whole_share_and_a_usable_price(
+    filled_qty: float, stop_price: float | None
+) -> None:
+    assert restored_stop("XLK", filled_qty, stop_price) is None

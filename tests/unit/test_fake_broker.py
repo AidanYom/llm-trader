@@ -188,6 +188,15 @@ def test_a_submitted_buy_stays_open_until_cancelled() -> None:
     assert broker.cancel_open_buy_orders() == [CancelledOrder(broker_order_id="fake-1", symbol="URA")]
 
 
+def test_a_submitted_stop_stays_open_until_an_exit_cancels_it() -> None:
+    broker = FakeBroker(now=MONDAY_PREMARKET)
+    broker.submit(Order(symbol="URA", side=Side.SELL, qty=3, stop_price=40.1), "llmt-2026-09-28-URA-stop")
+
+    assert broker.cancel_open_buy_orders() == []
+    assert broker.open_orders == [OpenOrder(broker_order_id="fake-1", symbol="URA", side=Side.SELL)]
+    assert broker.cancel_open_orders("URA") == ["fake-1"]
+
+
 def test_broker_calls_are_logged_but_reading_is_paper_is_not_one() -> None:
     broker = FakeBroker(now=MONDAY_PREMARKET)
 

@@ -94,11 +94,24 @@ def test_summary_lists_malformed_proposals_and_says_when_there_is_nothing() -> N
     ]
 
 
-def test_summary_names_shares_a_cancelled_entry_left_with_no_stop() -> None:
+def test_summary_shows_a_re_placed_stop_as_a_stop() -> None:
+    stop = OrderLine(
+        side=Side.SELL,
+        symbol="IGV",
+        qty=3,
+        status=OrderStatus.SUBMITTED,
+        detail="o-9, accepted",
+        stop_price=46.1,
+    )
+
+    assert summary(orders=[stop])[-1] == "  stop 3 IGV at $46.10: submitted (o-9, accepted)"
+
+
+def test_summary_names_shares_whose_stop_could_not_be_re_placed() -> None:
     lines = summary(unprotected=[CancelledOrder(broker_order_id="o-7", symbol="IGV", filled_qty=3.0)])
 
     assert lines[-2:] == [
-        "Shares with no stop, from partially filled entries cancelled with their stops:",
+        "Shares with no stop, from partially filled entries whose stop couldn't be re-placed:",
         "  IGV: 3 shares (entry o-7)",
     ]
 

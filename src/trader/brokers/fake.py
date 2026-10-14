@@ -7,7 +7,8 @@
   today's bar, and the canned news is timed back from `now`.
 - Every symbol has a plain made-up asset name, such as "XLE Fake Fund", unless a test gives it another.
 - It never fills an order. It records cancels and submissions and, like Alpaca, refuses a repeated
-  client_order_id. A submitted buy stays open, so a later run on the same broker cancels it as stale.
+  client_order_id. A submitted buy stays open, so a later run on the same broker cancels it as stale, and so
+  does a submitted stop, until an exit cancels it. Its cancels land at once.
 """
 
 from __future__ import annotations
@@ -132,9 +133,9 @@ class FakeBroker:
             raise BrokerError(f"client_order_id {client_order_id} has already been used")
         self.submitted.append((order, client_order_id))
         broker_order_id = f"fake-{len(self.submitted)}"
-        if order.side == Side.BUY:
+        if order.side == Side.BUY or order.is_stop:  # a market sell would have filled; these stay open
             self.open_orders.append(
-                OpenOrder(broker_order_id=broker_order_id, symbol=order.symbol, side=Side.BUY)
+                OpenOrder(broker_order_id=broker_order_id, symbol=order.symbol, side=order.side)
             )
         return SubmittedOrder(
             broker_order_id=broker_order_id, status="accepted", client_order_id=client_order_id

@@ -385,6 +385,35 @@ def record_cancelled_order(
     )
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class EntryOrder:
+    """A buy an earlier run sent: the proposal it came from, and the stop the risk engine approved for it."""
+
+    proposal_id: int
+    stop_price: float | None
+
+
+def entry_order(conn: Connection, broker_order_id: str) -> EntryOrder | None:
+    """The submitted buy with this broker order ID, or None if no run here recorded one.
+
+    When a submit run cancels a partially filled entry, it re-places the entry's stop at this price, and
+    records the new order against the same proposal (HANDOFF §8).
+    """
+    row = conn.execute(
+        select(orders.c.proposal_id, orders.c.stop_price)
+        .where(
+            orders.c.broker_order_id == broker_order_id,
+            orders.c.side == Side.BUY.value,
+            orders.c.status == OrderStatus.SUBMITTED.value,
+        )
+        .order_by(orders.c.id)
+        .limit(1)
+    ).first()
+    if row is None:
+        return None
+    return EntryOrder(proposal_id=_int(row.proposal_id), stop_price=_optional_float(row.stop_price))
+
+
 # ---- Risk context ----------------------------------------------------------------------------------------
 
 
